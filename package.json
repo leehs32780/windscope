@@ -18,7 +18,10 @@
     "test:watch": "vitest",
     "db:setup": "tsx scripts/db-setup.ts",
     "db:seed": "tsx scripts/db-seed.ts",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:edge": "playwright test --project=edge-desktop",
+    "test:e2e:cross-browser": "playwright test e2e/cross-engine.spec.ts e2e/mobile-engine.spec.ts",
+    "test:a11y": "playwright test e2e/accessibility.spec.ts --project=edge-desktop"
   },
   "dependencies": {
     "@react-three/drei": "10.7.9",
@@ -29,18 +32,19 @@
     "lucide-react": "1.81.0",
     "react": "19.3.1",
     "react-dom": "19.3.1",
-    "three": "0.187.0",
+    "three": "0.182.0",
     "tsx": "4.23.15",
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.14.1",
     "@playwright/test": "1.65.1",
     "@types/express": "5.0.6",
     "@types/node": "26.6.11",
     "@types/react": "19.3.3",
     "@types/react-dom": "19.3.0",
     "@types/supertest": "7.2.1",
-    "@types/three": "0.187.0",
+    "@types/three": "0.182.0",
     "@vitejs/plugin-react": "6.3.0",
     "concurrently": "10.0.7",
     "supertest": "7.3.2",
