@@ -1,5 +1,6 @@
 import express, { type ErrorRequestHandler, type Request, type Response } from "express";
 import { ZodError } from "zod";
+import { extname } from "node:path";
 import type { WindScopeDatabase } from "./db/client";
 import { projects } from "./db/schema";
 import {
@@ -26,6 +27,15 @@ function respond<T>(response: Response, data: T, status = 200): void {
 
 function errorHandler(): ErrorRequestHandler {
   return (error: unknown, _request: Request, response: Response, _next) => {
+    const bodyErrorType = error && typeof error === "object" && "type" in error ? error.type : undefined;
+    if (bodyErrorType === "entity.parse.failed") {
+      response.status(400).json({ error: { code: "INVALID_JSON", message: "올바른 JSON 요청 본문을 보내 주세요." } });
+      return;
+    }
+    if (bodyErrorType === "entity.too.large") {
+      response.status(413).json({ error: { code: "PAYLOAD_TOO_LARGE", message: "요청 본문은 100 KB 이하여야 합니다." } });
+      return;
+    }
     if (error instanceof ZodError) {
       response.status(400).json({
         error: {
@@ -93,7 +103,9 @@ export function createApp(db: WindScopeDatabase, clientBuildDirectory?: string) 
     if (typeof against !== "string" || against.length === 0) {
       throw new ApiError(400, "VALIDATION_ERROR", "against 기준 시나리오 ID가 필요합니다.");
     }
-    respond(response, await compareScenarioToBaseline(db, request.params.scenarioId!, against));
+    const mode = request.query.mode ?? "scenario";
+    if (mode !== "layout" && mode !== "scenario") throw new ApiError(400, "VALIDATION_ERROR", "비교 방식은 layout 또는 scenario여야 합니다.");
+    respond(response, await compareScenarioToBaseline(db, request.params.scenarioId!, against, mode));
   });
   app.post("/api/scenarios/:scenarioId/duplicate", async (request, response) => {
     const input = scenarioCreateSchema.parse(request.body);
@@ -106,7 +118,12 @@ export function createApp(db: WindScopeDatabase, clientBuildDirectory?: string) 
   });
   if (clientBuildDirectory) {
     app.use(express.static(clientBuildDirectory, { index: false, maxAge: "1h" }));
-    app.get("*splat", (_request, response, next) => {
+    app.get("/{*splat}", (request, response, next) => {
+      if (extname(request.path)) {
+        response.status(404).send("파일을 찾을 수 없습니다.");
+        return;
+      }
+      response.setHeader("Cache-Control", "no-cache");
       response.sendFile("index.html", { root: clientBuildDirectory }, (error) => {
         if (error) next(error);
       });

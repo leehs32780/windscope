@@ -15,7 +15,7 @@ const demoPowerCurve: PowerCurvePoint[] = [
   { windSpeedMps: 12, powerMW: 8 }
 ];
 
-export async function seedDemoFarm(db: WindScopeDatabase): Promise<void> {
+async function seedDemoFarmRows(db: WindScopeDatabase): Promise<void> {
   await db.insert(projects).values({
     id: DEMO_PROJECT_ID,
     name: "North Sea Demo · 샘플 단지",
@@ -65,5 +65,11 @@ export async function seedDemoFarm(db: WindScopeDatabase): Promise<void> {
     await db.insert(scenarioTurbines).values(placement).onConflictDoNothing().run();
     await db.insert(scenarioTurbines).values({ ...placement, scenarioId: EXPERIMENT_ID }).onConflictDoNothing().run();
   }
+}
+
+export async function seedDemoFarm(db: WindScopeDatabase): Promise<void> {
+  // The adapter holds the shared connection for this entire transaction. All
+  // bootstrap statements succeed together; existing rows are never overwritten.
+  await db.transaction(async () => seedDemoFarmRows(db));
 }
 
