@@ -68,6 +68,11 @@ export const projectCreateSchema = z.object({
   description: z.string().trim().max(1_000).optional()
 });
 
+export const projectUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().max(1_000).nullable().optional()
+}).refine((update) => Object.keys(update).length > 0, "한 가지 이상의 프로젝트 정보를 입력해 주세요.");
+
 export const scenarioCreateSchema = z.object({
   name: z.string().trim().min(1).max(120),
   sourceScenarioId: z.string().min(1).optional()
@@ -88,4 +93,38 @@ export const placementUpdateSchema = z.object({
   yM: z.number().finite().min(-FARM_COORDINATE_LIMIT_M).max(FARM_COORDINATE_LIMIT_M).optional(),
   command: z.enum(["operational", "manual_stop", "maintenance_stop"]).optional()
 }).refine((placement) => Object.keys(placement).length > 0, "위치 또는 운전 상태를 입력해 주세요.");
+
+const turbineSpecificationShape = {
+  name: z.string().trim().min(1).max(120),
+  ratedPowerMW: z.number().finite().positive().max(50),
+  rotorDiameterM: z.number().finite().min(20).max(300),
+  hubHeightM: z.number().finite().min(20).max(300),
+  cutInMps: z.number().finite().min(0).max(25),
+  ratedWindMps: z.number().finite().min(1).max(WIND_SPEED_MAX_MPS),
+  cutOutMps: z.number().finite().min(5).max(50),
+  thrustCoefficient: z.number().finite().min(0).max(0.99),
+  wakeExpansion: z.number().finite().min(0).max(0.3),
+  powerCurve: z.array(powerCurvePointSchema).min(2).max(30)
+};
+
+export const turbineCreateSchema = z.object({
+  ...turbineSpecificationShape,
+  xM: z.number().finite().min(-FARM_COORDINATE_LIMIT_M).max(FARM_COORDINATE_LIMIT_M),
+  yM: z.number().finite().min(-FARM_COORDINATE_LIMIT_M).max(FARM_COORDINATE_LIMIT_M),
+  displayOrder: z.number().int().min(0).max(10_000).optional()
+});
+
+export const turbineUpdateSchema = z.object({
+  name: turbineSpecificationShape.name.optional(),
+  ratedPowerMW: turbineSpecificationShape.ratedPowerMW.optional(),
+  rotorDiameterM: turbineSpecificationShape.rotorDiameterM.optional(),
+  hubHeightM: turbineSpecificationShape.hubHeightM.optional(),
+  cutInMps: turbineSpecificationShape.cutInMps.optional(),
+  ratedWindMps: turbineSpecificationShape.ratedWindMps.optional(),
+  cutOutMps: turbineSpecificationShape.cutOutMps.optional(),
+  thrustCoefficient: turbineSpecificationShape.thrustCoefficient.optional(),
+  wakeExpansion: turbineSpecificationShape.wakeExpansion.optional(),
+  powerCurve: turbineSpecificationShape.powerCurve.optional(),
+  displayOrder: z.number().int().min(0).max(10_000).optional()
+}).refine((update) => Object.keys(update).length > 0, "한 가지 이상의 터빈 설정을 입력해 주세요.");
 
