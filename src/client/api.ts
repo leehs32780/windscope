@@ -35,6 +35,9 @@ export type SimulationRun = SimulationResult & {
 };
 
 export type Comparison = {
+  mode: "layout" | "scenario";
+  conditionsDiffer: boolean;
+  turbineDeltas: Array<{ turbineId: string; name: string; baselinePowerMW: number; experimentPowerMW: number; deltaPowerMW: number }>;
   baseline: { scenarioId: string; name: string; totalPowerMW: number; wakeLossMW: number; wakeLossPercent: number | null };
   experiment: { scenarioId: string; name: string; totalPowerMW: number; wakeLossMW: number; wakeLossPercent: number | null };
   deltaPowerMW: number;
@@ -62,18 +65,31 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(`/api${path}`, {
       ...init,
+      signal: init?.signal ?? AbortSignal.timeout(15_000),
       headers: {
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
         ...init?.headers
       }
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError")) {
+      throw new ApiRequestError("서버 응답 시간이 초과되었습니다. 입력값을 확인한 뒤 다시 시도해 주세요.", 0, "TIMEOUT");
+    }
     throw new ApiRequestError("WindScope API에 연결할 수 없습니다. 서버가 실행 중인지 확인해 주세요.", 0, "NETWORK_ERROR");
   }
-  const body: unknown = await response.json().catch(() => null);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    if (response.ok) throw new ApiRequestError("서버 응답을 끝까지 읽지 못했습니다. 잠시 후 다시 시도해 주세요.", response.status, "INVALID_RESPONSE");
+    body = null;
+  }
   if (!response.ok) {
     const payload = body as { error?: { message?: string; code?: string } } | null;
     throw new ApiRequestError(payload?.error?.message ?? "서버 요청에 실패했습니다.", response.status, payload?.error?.code);
+  }
+  if (!body || typeof body !== "object" || !("data" in body)) {
+    throw new ApiRequestError("서버 응답 형식이 올바르지 않습니다. 다시 시도해 주세요.", response.status, "INVALID_RESPONSE");
   }
   return body as T;
 }
@@ -108,9 +124,9 @@ export const api = {
       body: JSON.stringify({})
     })).data;
   },
-  async compare(scenarioId: string, baselineScenarioId: string) {
+  async compare(scenarioId: string, baselineScenarioId: string, mode: "layout" | "scenario" = "layout") {
     return (await apiRequest<DataEnvelope<Comparison>>(
-      `/scenarios/${encodeURIComponent(scenarioId)}/compare?against=${encodeURIComponent(baselineScenarioId)}`
+      `/scenarios/${encodeURIComponent(scenarioId)}/compare?against=${encodeURIComponent(baselineScenarioId)}&mode=${mode}`
     )).data;
   },
   async duplicate(scenarioId: string, name: string) {
@@ -142,6 +158,7 @@ export function statusLabel(status: TurbineStatus | undefined, command?: Turbine
   if (status === "maintenance_stop" || command === "maintenance_stop") return "정비 정지";
   if (status === "low_wind") return "저풍속 대기";
   if (status === "high_wind") return "강풍 보호 정지";
+  if (!status) return "계산 대기";
   return "정상 가동";
 }
 
