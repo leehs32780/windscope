@@ -17,7 +17,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:setup": "tsx scripts/db-setup.ts",
-    "db:seed": "tsx scripts/db-seed.ts"
+    "db:seed": "tsx scripts/db-seed.ts",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@react-three/drei": "10.7.9",
@@ -33,6 +34,7 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@playwright/test": "1.65.1",
     "@types/express": "5.0.6",
     "@types/node": "26.6.11",
     "@types/react": "19.3.3",
@@ -47,7 +49,6 @@
     "vitest": "5.1.2"
   },
   "allowScripts": {
-    "better-sqlite3@13.2.0": true,
     "esbuild@0.28.2": true
   }
 }

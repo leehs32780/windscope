@@ -18,7 +18,7 @@ import {
   Zap
 } from "lucide-react";
 import { api, resultForTurbine, statusLabel, type Comparison, type FarmProject, type FarmScenario, type ProjectSummary, type SimulationRun } from "./api";
-import { validateLayout, type TurbineCommand, type TurbineInput } from "../shared/domain";
+import { normalizeDegrees, validateLayout, type TurbineCommand, type TurbineInput } from "../shared/domain";
 import "./styles.css";
 
 type WindDraft = { windSpeedMps: number; windDirectionDeg: number; airDensityKgM3: number };
@@ -60,7 +60,7 @@ function compactTime(): string {
 
 function statusClass(status: string | undefined, command?: TurbineCommand): string {
   if (command === "manual_stop" || command === "maintenance_stop" || status === "manual_stop" || status === "maintenance_stop") return "state state--stopped";
-  if (status === "high_wind" || status === "low_wind") return "state state--waiting";
+  if (!status || status === "high_wind" || status === "low_wind") return "state state--waiting";
   return "state state--operating";
 }
 
@@ -163,7 +163,7 @@ function WindControls({
         <div className="control-block">
           <div className="field-heading">
             <label htmlFor="wind-direction">풍향</label>
-            <div className="unit-input unit-input--direction"><input id="wind-direction" type="number" min={0} max={359} step={1} value={Math.round(draft.windDirectionDeg)} disabled={locked} onChange={(event) => onChange({ windDirectionDeg: parseNumber(event.target.value, draft.windDirectionDeg, 0, 359) })} /><span>°</span></div>
+            <div className="unit-input unit-input--direction"><input id="wind-direction" type="number" step={1} value={Math.round(draft.windDirectionDeg)} disabled={locked} onChange={(event) => onChange({ windDirectionDeg: normalizeDegrees(Number(event.target.value)) })} /><span>°</span></div>
           </div>
           <div className="compass-control">
             <WindCompass direction={draft.windDirectionDeg} onChange={onPreset} disabled={locked} />
@@ -195,7 +195,7 @@ function WindControls({
           <div><h2>배치 편집</h2><p>좌표 단위 m · 수평면 이동</p></div>
         </div>
         <div className="layout-actions">
-          <button type="button" className={editMode ? "button button--primary" : "button button--quiet"} disabled={locked} onClick={onToggleEdit} aria-pressed={editMode}>
+          <button type="button" className={editMode ? "button button--primary" : "button button--quiet"} disabled={locked || busy} onClick={onToggleEdit} aria-pressed={editMode}>
             <Move size={16} /> {editMode ? "편집 모드 켜짐" : "편집 모드"}
           </button>
           <button type="button" className="button button--quiet" disabled={locked || busy} onClick={onResetLayout} title="현재 실험 배치를 기준 배치 좌표로 복원합니다.">
@@ -235,6 +235,7 @@ function WindControls({
 
 function TurbineDetail({
   turbine,
+  baselineTurbine,
   result,
   scenario,
   busy,
@@ -245,6 +246,7 @@ function TurbineDetail({
   onUndo
 }: {
   turbine: TurbineInput | null;
+  baselineTurbine?: TurbineInput;
   result: ReturnType<typeof resultForTurbine>;
   scenario: FarmScenario | null;
   busy: boolean;
@@ -258,8 +260,8 @@ function TurbineDetail({
   const [yText, setYText] = useState("");
   const editable = scenario?.role === "experiment";
   useEffect(() => {
-    setXText(turbine ? String(Math.round(turbine.xM)) : "");
-    setYText(turbine ? String(Math.round(turbine.yM)) : "");
+    setXText(turbine ? String(turbine.xM) : "");
+    setYText(turbine ? String(turbine.yM) : "");
   }, [turbine?.id, turbine?.xM, turbine?.yM]);
 
   if (!turbine) {
@@ -272,7 +274,7 @@ function TurbineDetail({
     event.preventDefault();
     const xM = Number(xText);
     const yM = Number(yText);
-    if (Number.isFinite(xM) && Number.isFinite(yM)) onSavePosition({ xM, yM });
+    if (xText.trim() && yText.trim() && Number.isFinite(xM) && Number.isFinite(yM)) onSavePosition({ xM, yM });
   }
 
   return (
@@ -293,10 +295,12 @@ function TurbineDetail({
           <div><span>후류 감속</span><strong>{result ? `${result.wakeDeficitMps.toFixed(2)} m/s` : "—"}</strong></div>
           <div><span>로터 직경</span><strong>{turbine.rotorDiameterM.toFixed(0)} m</strong></div>
           <div><span>허브 높이</span><strong>{turbine.hubHeightM.toFixed(0)} m</strong></div>
+          <div><span>후류 출력 손실</span><strong>{result ? `${Math.max(0, result.noWakePowerMW - result.powerMW).toFixed(2)} MW` : "—"}</strong></div>
         </div>
+        <p className="helper-copy">출력 곡선: {turbine.cutInMps} m/s부터 발전 · {turbine.ratedWindMps} m/s에서 정격 · {turbine.cutOutMps} m/s 이상 보호 정지. 중간 출력은 곡선 점 사이를 선형 보간하고 공기 밀도로 보정합니다.</p>
         {result?.upstreamTurbineIds.length ? (
           <div className="wake-impact"><span>영향을 준 상류 터빈</span><strong>{result.upstreamTurbineIds.length}대</strong><small>{result.upstreamTurbineIds.join(" · ")}</small></div>
-        ) : <div className="wake-impact wake-impact--clear"><span>상류 후류 영향</span><strong>뚜렷한 영향 없음</strong></div>}
+        ) : <div className="wake-impact wake-impact--clear"><span>상류 후류 영향</span><strong>{result ? "뚜렷한 영향 없음" : "계산 대기"}</strong></div>}
       </section>
 
       <section className="panel-section panel-section--compact">
@@ -312,14 +316,15 @@ function TurbineDetail({
         </select>
         <form className="coordinate-form" onSubmit={submitPosition}>
           <div className="coordinate-fields">
-            <label><span>X · 동쪽 + (m)</span><input type="number" step={10} value={xText} disabled={!editable || busy} onChange={(event) => setXText(event.target.value)} /></label>
-            <label><span>Y · 북쪽 + (m)</span><input type="number" step={10} value={yText} disabled={!editable || busy} onChange={(event) => setYText(event.target.value)} /></label>
+            <label><span>X · 동쪽 + (m)</span><input type="number" required step="any" value={xText} disabled={!editable || busy} onChange={(event) => setXText(event.target.value)} /></label>
+            <label><span>Y · 북쪽 + (m)</span><input type="number" required step="any" value={yText} disabled={!editable || busy} onChange={(event) => setYText(event.target.value)} /></label>
           </div>
           <div className="coordinate-actions">
             <button className="button button--primary button--small" type="submit" disabled={!editable || busy}><Save size={14} /> 위치 저장</button>
             <button className="button button--quiet button--small" type="button" disabled={!editable || !lastPlacement || busy} onClick={onUndo} title="이 발전기의 직전 위치로 되돌립니다."><RotateCcw size={14} /> 되돌리기</button>
           </div>
         </form>
+        {baselineTurbine && <p className="helper-copy">기준 위치: X {baselineTurbine.xM} m · Y {baselineTurbine.yM} m</p>}
         {placementWarning && <div className="inline-warning"><AlertTriangle size={14} />{placementWarning}</div>}
         {!editable && <p className="helper-copy">기준 시나리오에서는 발전기 상태와 좌표를 바꿀 수 없습니다.</p>}
       </section>
@@ -331,12 +336,18 @@ function SummaryAndTable({
   scenario,
   result,
   comparison,
+  comparisonMode,
+  onComparisonMode,
+  disabled,
   selectedTurbineId,
   onSelect
 }: {
   scenario: FarmScenario | null;
   result: SimulationRun | null;
   comparison: Comparison | null;
+  comparisonMode: "layout" | "scenario";
+  onComparisonMode: (mode: "layout" | "scenario") => void;
+  disabled: boolean;
   selectedTurbineId: string;
   onSelect: (id: string) => void;
 }) {
@@ -352,6 +363,8 @@ function SummaryAndTable({
           <div><span className="eyebrow">FARM PERFORMANCE</span><h2>단지 운영 요약</h2></div>
           <span className="summary-run-state">{result ? <><Check size={14} /> 계산 완료 · {new Date(result.calculatedAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}</> : <><span className="spinner-dot" /> 조건 저장 후 계산합니다</>}</span>
         </div>
+        <label className="comparison-mode">비교 방식 <select aria-label="비교 방식" value={comparisonMode} disabled={disabled} onChange={(event) => onComparisonMode(event.target.value as "layout" | "scenario")}><option value="layout">배치만 비교 · 풍황과 운전 상태 동일</option><option value="scenario">전체 조건 비교 · 저장된 기준 조건</option></select></label>
+        {comparison?.conditionsDiffer && <p className="inline-warning">풍속·풍향·공기 밀도가 서로 다릅니다. 변화량에는 배치 외의 조건 차이도 포함됩니다.</p>}
         <div className="kpi-grid">
           <article className="kpi-card kpi-card--hero">
             <div className="kpi-card__top"><span>예상 단지 출력</span><span className="kpi-icon"><Zap size={16} /></span></div>
@@ -371,7 +384,7 @@ function SummaryAndTable({
           <article className="kpi-card">
             <div className="kpi-card__top"><span>가동 발전기</span><span className="kpi-icon kpi-icon--mint"><Gauge size={16} /></span></div>
             <strong>{result ? result.turbines.filter((item) => item.status === "operating").length : "—"}<small> / {scenario.turbines.length} 대</small></strong>
-            <span className="kpi-caption">강풍·저풍속·수동/정비 정지는 출력 0 MW</span>
+            <span className="kpi-caption">수동/정비 {result?.turbines.filter((t) => t.status === "manual_stop" || t.status === "maintenance_stop").length ?? "—"} · 저풍속 {result?.turbines.filter((t) => t.status === "low_wind").length ?? "—"} · 강풍 {result?.turbines.filter((t) => t.status === "high_wind").length ?? "—"}대</span>
           </article>
         </div>
         {comparison && <p className="comparison-definition">{comparison.comparisonDefinition} 기준: {comparison.baseline.name} · 현재: {comparison.experiment.name}</p>}
@@ -382,18 +395,21 @@ function SummaryAndTable({
           <div><span className="eyebrow">TURBINE OUTPUT</span><h2>발전기별 결과</h2></div>
           <span>{scenario.turbines.length}기 · 표로 읽을 수 있는 3D 대체 보기</span>
         </div>
-        <div className="table-scroll">
+        <div className="table-scroll" tabIndex={0} role="region" aria-label="발전기 결과표 · 가로와 세로로 스크롤할 수 있습니다">
           <table>
-            <thead><tr><th scope="col">발전기</th><th scope="col">상태</th><th scope="col">예상 출력</th><th scope="col">유효 풍속</th><th scope="col">후류 감속</th><th scope="col">출력률</th></tr></thead>
+            <thead><tr><th scope="col">발전기</th><th scope="col">상태</th><th scope="col">예상 출력</th><th scope="col">기준 출력</th><th scope="col">변화량</th><th scope="col">유효 풍속</th><th scope="col">후류 감속</th><th scope="col">출력률</th></tr></thead>
             <tbody>
               {scenario.turbines.map((turbine) => {
                 const turbineResult = resultById.get(turbine.id);
+                const turbineDelta = comparison?.turbineDeltas.find((item) => item.turbineId === turbine.id);
                 const percentage = turbineResult ? Math.min(100, turbineResult.powerMW / turbine.ratedPowerMW * 100) : 0;
                 return (
                   <tr key={turbine.id} className={selectedTurbineId === turbine.id ? "is-selected" : ""}>
                     <td><button type="button" className="table-select" onClick={() => onSelect(turbine.id)} aria-pressed={selectedTurbineId === turbine.id}><span className="table-turbine-dot" />{turbine.name}<small>{turbine.id}</small></button></td>
                     <td><span className={statusClass(turbineResult?.status, turbine.command)}><i />{statusLabel(turbineResult?.status, turbine.command)}</span></td>
                     <td className="table-number">{formatMw(turbineResult?.powerMW)} <small>MW</small></td>
+                    <td className="table-number">{formatMw(turbineDelta?.baselinePowerMW)} <small>MW</small></td>
+                    <td className="table-number">{formatSigned(turbineDelta?.deltaPowerMW)} <small>MW</small></td>
                     <td className="table-number">{turbineResult ? `${turbineResult.effectiveWindMps.toFixed(2)} m/s` : "—"}</td>
                     <td className="table-number">{turbineResult ? `${turbineResult.wakeDeficitMps.toFixed(2)} m/s` : "—"}</td>
                     <td><div className="table-bar-wrap"><div className="table-bar"><i style={{ width: `${percentage}%` }} /></div><small>{turbineResult ? `${percentage.toFixed(0)}%` : "—"}</small></div></td>
@@ -413,8 +429,10 @@ function App() {
   const [project, setProject] = useState<FarmProject | null>(null);
   const [scenarioId, setScenarioId] = useState("");
   const [scenario, setScenario] = useState<FarmScenario | null>(null);
+  const [baselineTurbines, setBaselineTurbines] = useState<TurbineInput[]>([]);
   const [result, setResult] = useState<SimulationRun | null>(null);
   const [comparison, setComparison] = useState<Comparison | null>(null);
+  const [comparisonMode, setComparisonMode] = useState<"layout" | "scenario">("layout");
   const [draft, setDraft] = useState<WindDraft>({ windSpeedMps: 9.5, windDirectionDeg: 0, airDensityKgM3: 1.225 });
   const [selectedTurbineId, setSelectedTurbineId] = useState("");
   const [editMode, setEditMode] = useState(false);
@@ -430,6 +448,7 @@ function App() {
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("scene");
   const [fitVersion, setFitVersion] = useState(0);
   const [resetVersion, setResetVersion] = useState(0);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const epochRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
 
@@ -443,8 +462,19 @@ function App() {
     Math.abs(scenario.windDirectionDeg - draft.windDirectionDeg) > 0.001 ||
     Math.abs(scenario.airDensityKgM3 - draft.airDensityKgM3) > 0.0001
   ));
-  const visibleResult = scenarioIsDirty ? null : result;
-  const visibleComparison = scenarioIsDirty ? null : comparison;
+  const interactionLocked = busy || loading || scenarioIsDirty;
+  const previewIsDirty = scenario?.turbines.some((turbine) => {
+    const preview = previewPositions[turbine.id];
+    return preview && (preview.xM !== turbine.xM || preview.yM !== turbine.yM);
+  });
+  const visibleResult = interactionLocked || previewIsDirty ? null : result;
+  const visibleComparison = interactionLocked || previewIsDirty ? null : comparison;
+
+  useEffect(() => {
+    if (project?.scenarios.some((item) => item.id === scenarioId)) {
+      try { localStorage.setItem("windscope.selection", JSON.stringify({ projectId: project.id, scenarioId })); } catch { /* Storage is optional. */ }
+    }
+  }, [project?.id, scenarioId]);
 
   useEffect(() => {
     let alive = true;
@@ -456,10 +486,12 @@ function App() {
         if (!alive) return;
         setProjects(projectList);
         if (!projectList.length) throw new Error("프로젝트가 없습니다. DB 시드가 준비됐는지 확인해 주세요.");
-        const firstProject = await api.getProject(projectList[0]!.id);
+        let remembered: { projectId?: string; scenarioId?: string } = {};
+        try { remembered = JSON.parse(localStorage.getItem("windscope.selection") ?? "{}") ?? {}; } catch { /* Use the demo when browser storage is unavailable. */ }
+        const firstProject = await api.getProject(projectList.find((item) => item.id === remembered.projectId)?.id ?? projectList[0]!.id);
         if (!alive) return;
         setProject(firstProject);
-        const initialScenario = firstProject.scenarios.find((item) => item.role === "experiment") ?? firstProject.scenarios[0];
+        const initialScenario = firstProject.scenarios.find((item) => item.id === remembered.scenarioId) ?? firstProject.scenarios.find((item) => item.role === "experiment") ?? firstProject.scenarios[0];
         if (!initialScenario) throw new Error("사용할 시나리오가 없습니다.");
         setScenarioId(initialScenario.id);
       } catch (caught) {
@@ -476,6 +508,8 @@ function App() {
     const baselineScenarioId = project.baselineScenarioId;
     const epoch = ++epochRef.current;
     setLoading(true);
+    setBusy(false);
+    setScenario(null);
     setError("");
     setResult(null);
     setComparison(null);
@@ -485,9 +519,13 @@ function App() {
     setLayoutWarning("");
     async function loadScenario() {
       try {
-        const detail = await api.getScenario(scenarioId);
+        const [detail, baseline] = await Promise.all([
+          api.getScenario(scenarioId),
+          baselineScenarioId ? api.getScenario(baselineScenarioId) : Promise.resolve(null)
+        ]);
         if (epoch !== epochRef.current) return;
         setScenario(detail);
+        setBaselineTurbines(baseline?.turbines ?? []);
         setDraft({ windSpeedMps: detail.windSpeedMps, windDirectionDeg: detail.windDirectionDeg, airDensityKgM3: detail.airDensityKgM3 });
         setScenarioNameDraft(detail.name);
         setSelectedTurbineId((selected) => detail.turbines.some((turbine) => turbine.id === selected) ? selected : detail.turbines[0]?.id ?? "");
@@ -496,7 +534,7 @@ function App() {
         if (epoch !== epochRef.current) return;
         setResult(latest);
         if (baselineScenarioId) {
-          const nextComparison = await api.compare(detail.id, baselineScenarioId);
+          const nextComparison = await api.compare(detail.id, baselineScenarioId, comparisonMode);
           if (epoch !== epochRef.current) return;
           setComparison(nextComparison);
         }
@@ -508,13 +546,16 @@ function App() {
       }
     }
     void loadScenario();
-  }, [scenarioId, project]);
+    return () => { if (epochRef.current === epoch) epochRef.current++; };
+  }, [scenarioId, project?.id, project?.baselineScenarioId, reloadVersion]);
 
   useEffect(() => {
-    if (!scenario || !editable || !scenarioIsDirty) return;
+    if (!scenario || !editable || busy || loading || saveState === "error") return;
+    if (!scenarioIsDirty) {
+      if (saveState === "pending") setSaveState("saved");
+      return;
+    }
     setSaveState("pending");
-    setResult(null);
-    setComparison(null);
     if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(() => {
       void persistSettings(scenario.id, draft);
@@ -522,27 +563,32 @@ function App() {
     return () => {
       if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
     };
-  }, [draft, editable, scenario?.id, scenario?.windSpeedMps, scenario?.windDirectionDeg, scenario?.airDensityKgM3, scenarioIsDirty]);
+  }, [draft, editable, scenario?.id, scenario?.windSpeedMps, scenario?.windDirectionDeg, scenario?.airDensityKgM3, scenarioIsDirty, busy, loading, saveState]);
 
   async function runAndCompare(scenarioIdToRun: string, epoch: number) {
     const latest = await api.simulate(scenarioIdToRun);
     if (epoch !== epochRef.current) return;
     setResult(latest);
     if (project?.baselineScenarioId) {
-      const nextComparison = await api.compare(scenarioIdToRun, project.baselineScenarioId);
+      const nextComparison = await api.compare(scenarioIdToRun, project.baselineScenarioId, comparisonMode);
       if (epoch !== epochRef.current) return;
       setComparison(nextComparison);
     }
   }
 
   async function persistSettings(id: string, settings: WindDraft) {
+    if (busy || loading) return;
+    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
     const epoch = ++epochRef.current;
+    setBusy(true);
     setSaveState("saving");
     setError("");
     try {
       const updated = await api.updateSettings(id, settings);
       if (epoch !== epochRef.current) return;
       setScenario(updated);
+      setResult(null);
+      setComparison(null);
       await runAndCompare(id, epoch);
       if (epoch === epochRef.current) setSaveState("saved");
     } catch (caught) {
@@ -550,15 +596,36 @@ function App() {
         setSaveState("error");
         setError(caught instanceof Error ? caught.message : "조건을 저장하지 못했습니다.");
       }
+    } finally {
+      if (epoch === epochRef.current) setBusy(false);
     }
   }
 
   function changeDraft(change: Partial<WindDraft>) {
+    if (busy || loading) return;
+    setSaveState("pending");
     setDraft((current) => ({ ...current, ...change }));
   }
 
+  async function changeComparisonMode(mode: "layout" | "scenario") {
+    if (!scenario || !project?.baselineScenarioId || interactionLocked) return;
+    const epoch = ++epochRef.current;
+    setComparisonMode(mode);
+    setComparison(null);
+    setBusy(true);
+    setError("");
+    try {
+      const next = await api.compare(scenario.id, project.baselineScenarioId, mode);
+      if (epoch === epochRef.current) setComparison(next);
+    } catch (caught) {
+      if (epoch === epochRef.current) setError(caught instanceof Error ? caught.message : "비교 결과를 불러오지 못했습니다.");
+    } finally {
+      if (epoch === epochRef.current) setBusy(false);
+    }
+  }
+
   async function commitPlacement(turbineId: string, position: { xM: number; yM: number }) {
-    if (!scenario || !editable) return;
+    if (!scenario || !editable || interactionLocked) return;
     const target = scenario.turbines.find((turbine) => turbine.id === turbineId);
     if (!target) return;
     const candidateLayout = scenario.turbines.map((turbine) => turbine.id === turbineId ? { ...turbine, ...position } : turbine);
@@ -577,12 +644,12 @@ function App() {
     setSaveState("saving");
     setResult(null);
     setComparison(null);
-    setLastPlacement({ turbineId, xM: target.xM, yM: target.yM });
     const epoch = ++epochRef.current;
     try {
       const updated = await api.updatePlacement(scenario.id, turbineId, position);
       if (epoch !== epochRef.current) return;
       setPreviewPositions({});
+      setLastPlacement({ turbineId, xM: target.xM, yM: target.yM });
       setScenario(updated.scenario);
       const serverWarning = updated.layoutIssues.find((issue) => issue.severity === "warning");
       setLayoutWarning(serverWarning?.message ?? warning?.message ?? "");
@@ -600,7 +667,7 @@ function App() {
   }
 
   async function changeTurbineCommand(command: TurbineCommand) {
-    if (!scenario || !selectedTurbine) return;
+    if (!scenario || !selectedTurbine || interactionLocked) return;
     setBusy(true);
     setSaveState("saving");
     setError("");
@@ -632,8 +699,10 @@ function App() {
   }
 
   async function resetLayout() {
-    if (!scenario || !editable) return;
+    if (!scenario || !editable || interactionLocked) return;
+    if (!window.confirm("현재 실험의 위치와 운전 상태를 기준 배치로 복원할까요? 바람 조건은 유지됩니다.")) return;
     setBusy(true);
+    setSaveState("saving");
     setError("");
     setResult(null);
     setComparison(null);
@@ -648,18 +717,21 @@ function App() {
       await runAndCompare(updated.id, epoch);
       if (epoch === epochRef.current) setSaveState("saved");
     } catch (caught) {
-      if (epoch === epochRef.current) setError(caught instanceof Error ? caught.message : "기준 배치를 복원하지 못했습니다.");
+      if (epoch === epochRef.current) {
+        setError(caught instanceof Error ? caught.message : "기준 배치를 복원하지 못했습니다.");
+        setSaveState("error");
+      }
     } finally {
       if (epoch === epochRef.current) setBusy(false);
     }
   }
 
   async function duplicateScenario(name?: string) {
-    if (!scenario || !project) return;
+    if (!scenario || !project || interactionLocked) return;
     setBusy(true);
     setError("");
     try {
-      const duplicate = await api.duplicate(scenario.id, name ?? `${scenario.name} 복사 · ${compactTime()}`);
+      const duplicate = await api.duplicate(scenario.id, name ?? `${scenario.name.slice(0, 95)} 복사 · ${compactTime()}`);
       const freshProject = await api.getProject(project.id);
       setProject(freshProject);
       setScenarioId(duplicate.id);
@@ -672,7 +744,7 @@ function App() {
   }
 
   async function applyExperimentPreset(presetId: string) {
-    if (!scenario || !project) return;
+    if (!scenario || !project || interactionLocked) return;
     setBusy(true);
     setError("");
     try {
@@ -697,7 +769,7 @@ function App() {
   }
 
   async function renameScenario() {
-    if (!scenario || !editable || !scenarioNameDraft.trim()) return;
+    if (!scenario || !editable || !scenarioNameDraft.trim() || interactionLocked) return;
     setBusy(true);
     setError("");
     try {
@@ -713,13 +785,15 @@ function App() {
   }
 
   async function switchProject(projectId: string) {
+    if (interactionLocked) return;
     setLoading(true);
     setError("");
     try {
       const nextProject = await api.getProject(projectId);
       setProject(nextProject);
       const nextScenario = nextProject.scenarios.find((item) => item.role === "experiment") ?? nextProject.scenarios[0];
-      if (nextScenario) setScenarioId(nextScenario.id);
+      setScenarioId(nextScenario?.id ?? "");
+      if (!nextScenario) { setScenario(null); setLoading(false); setError("사용할 시나리오가 없습니다."); }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "프로젝트를 바꾸지 못했습니다.");
       setLoading(false);
@@ -753,19 +827,19 @@ function App() {
         <div className="header-context">
           <label className="header-select-wrap">
             <span>프로젝트</span>
-            <select value={currentProject.id} onChange={(event) => void switchProject(event.target.value)} aria-label="프로젝트 선택">
+            <select value={currentProject.id} disabled={interactionLocked} onChange={(event) => void switchProject(event.target.value)} aria-label="프로젝트 선택">
               {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </select><ChevronDown size={13} />
           </label>
           <span className="header-divider" />
           <label className="header-select-wrap header-select-wrap--scenario">
             <span>시나리오</span>
-            <select value={scenarioId} onChange={(event) => setScenarioId(event.target.value)} aria-label="시나리오 선택">
+            <select value={scenarioId} disabled={interactionLocked} onChange={(event) => setScenarioId(event.target.value)} aria-label="시나리오 선택">
               {currentProject.scenarios.map((item) => <option key={item.id} value={item.id}>{item.role === "baseline" ? "기준 · " : "실험 · "}{item.name}</option>)}
             </select><ChevronDown size={13} />
           </label>
           <span className={`save-pill save-pill--${saveState}`}><i />{saveLabel}</span>
-          <button type="button" className="header-action" onClick={() => void duplicateScenario()} disabled={busy || !scenario} title="현재 시나리오 복제"><Copy size={15} /><span>실험 복제</span></button>
+          <button type="button" className="header-action" onClick={() => void duplicateScenario()} disabled={interactionLocked || !scenario} title="현재 시나리오 복제"><Copy size={15} /><span>실험 복제</span></button>
         </div>
         <a className="header-help" href="#model-assumptions" aria-label="모델 가정 보기"><CircleHelp size={16} /><span>모델 가정</span></a>
       </header>
@@ -778,7 +852,7 @@ function App() {
       {(error || notice) && <div className={`toast-banner ${error ? "toast-banner--error" : "toast-banner--success"}`} role={error ? "alert" : "status"}>
         {error ? <AlertTriangle size={16} /> : <Check size={16} />}
         <span>{error || notice}</span>
-        {error && scenarioIsDirty && editable && <button type="button" onClick={() => void persistSettings(scenario!.id, draft)}>다시 저장</button>}
+        {error && <button type="button" disabled={busy || loading} onClick={() => scenarioIsDirty && editable ? void persistSettings(scenario!.id, draft) : setReloadVersion((value) => value + 1)}>{scenarioIsDirty && editable ? "다시 저장" : "다시 불러오기"}</button>}
         <button type="button" className="toast-close" aria-label="닫기" onClick={() => { setError(""); setNotice(""); }}>×</button>
       </div>}
 
@@ -790,7 +864,7 @@ function App() {
         <aside className="left-panel">
           <WindControls
             draft={draft}
-            disabled={!scenario || busy}
+            disabled={!scenario || busy || loading}
             onChange={changeDraft}
             onPreset={(degrees) => changeDraft({ windDirectionDeg: degrees })}
             onResetLayout={() => void resetLayout()}
@@ -799,7 +873,7 @@ function App() {
             onScenarioDuplicate={() => void duplicateScenario()}
             onApplyPreset={(id) => void applyExperimentPreset(id)}
             scenario={scenario}
-            busy={busy}
+            busy={interactionLocked}
           />
         </aside>
 
@@ -818,7 +892,7 @@ function App() {
             windSpeedMps={draft.windSpeedMps}
             windDirectionDeg={draft.windDirectionDeg}
             selectedTurbineId={selectedTurbineId}
-            editMode={editMode && editable}
+            editMode={editMode && editable && !interactionLocked}
             previewPositions={previewPositions}
             onSelect={(id) => { if (id) setSelectedTurbineId(id); }}
             onHover={() => undefined}
@@ -831,6 +905,9 @@ function App() {
             scenario={scenario}
             result={visibleResult}
             comparison={visibleComparison}
+            comparisonMode={comparisonMode}
+            onComparisonMode={(mode) => void changeComparisonMode(mode)}
+            disabled={interactionLocked}
             selectedTurbineId={selectedTurbineId}
             onSelect={setSelectedTurbineId}
           />
@@ -840,11 +917,12 @@ function App() {
           <section className="scenario-editor panel-section">
             <div className="section-title-row"><div className="section-icon section-icon--scenario"><Save size={16} /></div><div><h2>시나리오 정보</h2><p>기준과 실험을 독립 보존</p></div></div>
             <label className="form-label" htmlFor="scenario-name">시나리오 이름</label>
-            <div className="scenario-name-input"><input id="scenario-name" value={scenarioNameDraft} disabled={!editable || busy} onChange={(event) => setScenarioNameDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void renameScenario(); }} /><button type="button" aria-label="시나리오 이름 저장" title="이름 저장" disabled={!editable || busy || scenarioNameDraft.trim() === scenario?.name} onClick={() => void renameScenario()}><Save size={14} /></button></div>
+            <div className="scenario-name-input"><input id="scenario-name" maxLength={120} value={scenarioNameDraft} disabled={!editable || interactionLocked} onChange={(event) => setScenarioNameDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void renameScenario(); }} /><button type="button" aria-label="시나리오 이름 저장" title="이름 저장" disabled={!editable || interactionLocked || !scenarioNameDraft.trim() || scenarioNameDraft.trim() === scenario?.name} onClick={() => void renameScenario()}><Save size={14} /></button></div>
             <div className="scenario-meta"><span>{scenario?.role === "baseline" ? "기준 배치" : "실험 배치"}</span><span>{scenario?.turbines.length ?? 0}기</span></div>
           </section>
           <TurbineDetail
             turbine={selectedTurbineDisplay}
+            baselineTurbine={baselineTurbines.find((turbine) => turbine.id === selectedTurbine?.id)}
             result={selectedResult}
             scenario={scenario}
             busy={busy || loading || isSettingDirty}
@@ -860,6 +938,8 @@ function App() {
               <li>풍향 기준: 북쪽 0°, 시계 방향 증가</li>
               <li>무후류 출력 대비 손실률로 표시</li>
               <li>다중 후류 결손은 RSS로 합성</li>
+              <li>Ct 0.8 · 후류 확장 k 0.05 (샘플)</li>
+              <li>공기 밀도 기준 1.225 kg/m³</li>
               <li>정지 터빈의 공력 효과는 미반영</li>
             </ul>
             <p>제조사 성능 곡선·실측 풍황·대기 안정도·지형·파랑을 반영한 인증 설계 도구가 아닙니다.</p>

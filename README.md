@@ -46,9 +46,26 @@ All outputs are estimates. They are not certified engineering calculations and s
 npm test
 npm run typecheck
 npm run build
+npm run test:e2e
 ```
 
 `npm run db:setup` applies pending versioned SQLite migrations and inserts only missing demo records. `npm run db:seed` repeats the non-destructive sample-data check. Neither command drops tables or resets the database.
+
+Browser checks use installed Microsoft Edge on Windows and an isolated temporary SQLite database. On other systems, install Chromium with `npx playwright install chromium`. Set `PLAYWRIGHT_CHANNEL=chrome` to check an installed Chrome instead. Browser tests cover actual WebGL rendering, rotor motion, wake direction, pointer dragging, baseline protection, saved state, failed requests, timeouts, mobile layout and WebGL context recovery.
+
+The comparison selector offers **배치만 비교** (identical weather and operating commands, different positions) and **전체 조건 비교** (each scenario's stored conditions). Baseline data is preserved in both modes. Per-turbine baseline output and differences are included in the results table.
+
+The wake model version is `jensen-circle-overlap-rss-v2`. Centerline deficit uses `(1 - sqrt(1 - Ct)) / (1 + k*x/R)^2`, following [the Jensen equation in Wind Energy Science, equation 6](https://wes.copernicus.org/articles/5/1601/2020/). Old saved results are detected as stale after input or model changes.
+
+For a database backup, stop the app and copy the entire `data/` directory to a separate backup directory. Restore only while the app is stopped. If startup fails, check Node version, occupied ports, `.env` values, and write permission for the database directory; the terminal prints the underlying error.
+
+### Audit results (2026-11-26)
+
+- Type checking and production build passed; 44 numerical, API, database and scene-math tests passed.
+- Eight Edge browser scenarios passed across the full run and targeted timeout rerun. The timeout harness was corrected to avoid aborting a request already cancelled by the app.
+- Fresh `npm run dev` prepared an isolated database, served the frontend and proxied API health with HTTP 200; both services stopped with Ctrl+C.
+- Screenshots were inspected at desktop and 390 px mobile widths. Browser checks use a headless Edge context; physical mobile devices and other browser engines have not been checked.
+- Remaining non-fatal warnings: Fiber uses the deprecated `THREE.Clock`; the lazily loaded 3D chunk exceeds Vite's 500 KB warning threshold (about 277 KB gzip). Engineering accuracy still requires manufacturer/site calibration.
 
 ## Main areas
 
