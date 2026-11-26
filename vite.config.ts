@@ -19,7 +19,34 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       outDir: "dist/client",
-      emptyOutDir: true
+      emptyOutDir: true,
+      // Three.js is intentionally lazy-loaded with the scene. Split its large ESM
+      // graph into cacheable chunks so no single deferred file crosses Vite's
+      // default 500 kB warning threshold.
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                name: "three-core",
+                test: /node_modules[\\/]three[\\/]/,
+                maxSize: 380_000,
+                minSize: 40_000,
+                includeDependenciesRecursively: false,
+                priority: 20
+              },
+              {
+                name: "react-three",
+                test: /node_modules[\\/](@react-three|three-stdlib|zustand|suspend-react|its-fine)[\\/]/,
+                maxSize: 380_000,
+                minSize: 40_000,
+                includeDependenciesRecursively: false,
+                priority: 10
+              }
+            ]
+          }
+        }
+      }
     }
   };
 });

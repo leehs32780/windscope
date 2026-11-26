@@ -26,9 +26,19 @@ The default database is `data/windscope.db`. The `data/` directory and SQLite fi
 - Change wind speed with the slider or number field. Change wind direction with the compass, degree field, or cardinal presets. The angle is measured clockwise from north, and the displayed arrow points to where the wind comes from.
 - Select a turbine in the scene or the results table to inspect its current estimated output, effective wind speed, wake deficit, status, and coordinates.
 - Use **실험 복제** or a quick experiment preset to make an editable copy. Presets never replace the selected scenario.
+- Open **관리** to create, edit or delete projects; add/edit/delete turbine definitions; enter a manufacturer-supplied power curve as JSON; delete experiments; or promote an experiment to the baseline. A new project intentionally starts empty and guides you to add its first turbine.
 - Turn on **편집 모드** to drag turbines on the horizontal plane. You can also save X (east-positive) and Y (north-positive) coordinates in metres. The interface flags close spacing and blocks overlapping placements. **기준 배치 복원** copies baseline positions and commands into the selected experiment.
 - Set an individual turbine to normal operation, manual stop, or maintenance stop. Manual and maintenance stops produce no power and are not treated as wake sources by this simplified model.
 - Compare the selected experiment with the project's read-only baseline. The output change is `experiment total output - baseline total output`. Wake-loss percentage is each scenario's estimated loss divided by that scenario's no-wake output.
+- The turbine comparison chart is keyboard selectable and is paired with the exact-value results table, so the same information remains available without relying on colour or the 3D scene.
+
+## Data lifecycle and deletion policy
+
+- A project owns its turbine definitions, baseline, experiments, placements and stored simulation runs. Deleting a project removes that full owned graph in one database transaction.
+- Deleting a turbine removes it from every scenario in the project and removes its stored per-turbine results. The next run is recalculated from the changed input hash.
+- Deleting an experiment removes its placements and stored runs. The current baseline cannot be deleted directly.
+- Promoting an experiment copies it into the stable baseline record, archives the previous baseline as an experiment, and leaves an editable experiment available. A partial unique SQLite index guarantees one baseline per project.
+- Project, scenario and turbine reads are isolated behind `src/server/repositories/farm-repository.ts`; multi-row validation and writes remain in the service transaction layer.
 
 ## Model assumptions
 
@@ -47,11 +57,13 @@ npm test
 npm run typecheck
 npm run build
 npm run test:e2e
+npm run test:a11y
+npm run test:e2e:cross-browser
 ```
 
 `npm run db:setup` applies pending versioned SQLite migrations and inserts only missing demo records. `npm run db:seed` repeats the non-destructive sample-data check. Neither command drops tables or resets the database.
 
-Browser checks use installed Microsoft Edge on Windows and an isolated temporary SQLite database. On other systems, install Chromium with `npx playwright install chromium`. Set `PLAYWRIGHT_CHANNEL=chrome` to check an installed Chrome instead. Browser tests cover actual WebGL rendering, rotor motion, wake direction, pointer dragging, baseline protection, saved state, failed requests, timeouts, mobile layout and WebGL context recovery.
+Browser checks use installed Microsoft Edge on Windows and an isolated temporary SQLite database. Install the bundled cross-engine browsers with `npx playwright install chromium firefox webkit`; set `PLAYWRIGHT_CHANNEL=chrome` to use an installed Chrome for Chromium projects. Browser tests cover actual WebGL rendering, rotor motion, wake direction, pointer dragging, project/turbine management, baseline promotion, saved state, failed requests, timeouts, WCAG A/AA automation, keyboard flow, mobile layout and WebGL context recovery.
 
 The comparison selector offers **배치만 비교** (identical weather and operating commands, different positions) and **전체 조건 비교** (each scenario's stored conditions). Baseline data is preserved in both modes. Per-turbine baseline output and differences are included in the results table.
 
@@ -61,15 +73,16 @@ For a database backup, stop the app and copy the entire `data/` directory to a s
 
 ### Audit results (2026-11-26)
 
-- Type checking and production build passed; 44 numerical, API, database and scene-math tests passed.
-- Eight Edge browser scenarios passed across the full run and targeted timeout rerun. The timeout harness was corrected to avoid aborting a request already cancelled by the app.
-- Fresh `npm run dev` prepared an isolated database, served the frontend and proxied API health with HTTP 200; both services stopped with Ctrl+C.
-- Screenshots were inspected at desktop and 390 px mobile widths. Browser checks use a headless Edge context; physical mobile devices and other browser engines have not been checked.
-- Remaining non-fatal warnings: Fiber uses the deprecated `THREE.Clock`; the lazily loaded 3D chunk exceeds Vite's 500 KB warning threshold (about 277 KB gzip). Engineering accuracy still requires manufacturer/site calibration.
+- Type checking and the production build pass; 47 numerical, API, database and scene-math tests pass.
+- All 16 browser checks pass. The Edge suite covers real WebGL rendering and animation, drag persistence, failure recovery, project/turbine CRUD, baseline promotion, accessibility and keyboard operation. Firefox desktop, WebKit desktop, Edge mobile emulation and WebKit iPhone emulation also pass the core 3D/layout checks.
+- A clean source archive installs 238 packages with `npm ci` and reports zero vulnerabilities; fresh database setup, all 47 tests and the production build pass from that copy.
+- The production bundle is split into React Three and Three core groups and builds without Vite's former large-chunk warning.
+- Three.js is intentionally pinned to r182, within Fiber and Drei's declared compatibility ranges, until React Three Fiber replaces its deprecated internal `Clock` with `Timer`. This removes the runtime deprecation warning without suppressing console output.
+- Automated mobile emulation is covered, but physical iOS/Android devices and assistive-technology sessions still require human/device-lab verification. Engineering accuracy still requires manufacturer power curves, site measurements and validated flow-model calibration.
 
 ## Main areas
 
 - `src/client/` — dashboard, API client, responsive controls, and React Three Fiber scene.
-- `src/server/` — Express routes and scenario/simulation services.
+- `src/server/` — Express routes, transactional scenario/simulation services, and the farm repository boundary.
 - `src/server/db/` — typed Drizzle schema, versioned SQL migrations, and sample seed.
 - `src/shared/` — domain types, unit/coordinate helpers, validation, and the pure simulation model.
