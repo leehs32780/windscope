@@ -79,8 +79,8 @@ export function normalizeDegrees(degrees: number): number {
 export function windFlowVector(windDirectionDeg: number): { east: number; north: number } {
   const flowRadians = ((normalizeDegrees(windDirectionDeg) + 180) * Math.PI) / 180;
   return {
-    east: Math.sin(flowRadians),
-    north: Math.cos(flowRadians)
+    east: Math.abs(Math.sin(flowRadians)) < 1e-12 ? 0 : Math.sin(flowRadians),
+    north: Math.abs(Math.cos(flowRadians)) < 1e-12 ? 0 : Math.cos(flowRadians)
   };
 }
 
@@ -93,9 +93,13 @@ export function worldToFarm(x: number, z: number, scale = SCENE_METERS_TO_UNITS)
   return [x / scale, -z / scale];
 }
 
-export function validateLayout(turbines: Pick<TurbineInput, "id" | "xM" | "yM">[]): LayoutIssue[] {
+export function validateLayout(turbines: (Pick<TurbineInput, "id" | "xM" | "yM"> & Partial<Pick<TurbineInput, "rotorDiameterM">>)[]): LayoutIssue[] {
   const issues: LayoutIssue[] = [];
   for (const turbine of turbines) {
+    if (!Number.isFinite(turbine.xM) || !Number.isFinite(turbine.yM)) {
+      issues.push({ turbineId: turbine.id, severity: "error", message: "발전기 좌표는 유한한 숫자여야 합니다." });
+      continue;
+    }
     if (Math.abs(turbine.xM) > FARM_COORDINATE_LIMIT_M || Math.abs(turbine.yM) > FARM_COORDINATE_LIMIT_M) {
       issues.push({ turbineId: turbine.id, severity: "error", message: "단지 허용 경계(±10 km)를 벗어났습니다." });
     }
@@ -105,11 +109,17 @@ export function validateLayout(turbines: Pick<TurbineInput, "id" | "xM" | "yM">[
       const first = turbines[firstIndex]!;
       const second = turbines[secondIndex]!;
       const distanceM = Math.hypot(first.xM - second.xM, first.yM - second.yM);
-      if (distanceM < MIN_TURBINE_SPACING_M) {
+      // Conservative horizontal clearance for any nacelle orientation.
+      const rotorClearanceM = ((first.rotorDiameterM ?? 120) + (second.rotorDiameterM ?? 120)) / 2;
+      const recommendedSpacingM = Math.max(MIN_TURBINE_SPACING_M, rotorClearanceM);
+      if (distanceM < recommendedSpacingM) {
+        const overlapping = distanceM < rotorClearanceM;
         issues.push({
           turbineId: second.id,
-          severity: distanceM < 120 ? "error" : "warning",
-          message: `${first.id}와 간격이 ${Math.round(distanceM)} m입니다. 권장 최소 간격은 ${MIN_TURBINE_SPACING_M} m입니다.`
+          severity: overlapping ? "error" : "warning",
+          message: overlapping
+            ? `${first.id}와 간격이 ${Math.round(distanceM)} m입니다. 로터가 겹치지 않도록 ${Math.round(rotorClearanceM)} m 이상 떨어뜨려 주세요.`
+            : `${first.id}와 간격이 ${Math.round(distanceM)} m입니다. 권장 최소 간격은 ${Math.round(recommendedSpacingM)} m입니다.`
         });
       }
     }

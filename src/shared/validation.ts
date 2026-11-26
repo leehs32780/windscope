@@ -25,9 +25,29 @@ export const turbineInputSchema = z.object({
   if (!(turbine.cutInMps < turbine.ratedWindMps && turbine.ratedWindMps < turbine.cutOutMps)) {
     context.addIssue({ code: "custom", message: "컷인 < 정격 풍속 < 컷아웃 순서여야 합니다.", path: ["ratedWindMps"] });
   }
+  if (turbine.hubHeightM <= turbine.rotorDiameterM / 2) {
+    context.addIssue({ code: "custom", message: "허브 높이는 블레이드가 수면에 닿지 않도록 로터 반경보다 커야 합니다.", path: ["hubHeightM"] });
+  }
   const speeds = turbine.powerCurve.map((point) => point.windSpeedMps);
   if (new Set(speeds).size !== speeds.length) {
     context.addIssue({ code: "custom", message: "출력 곡선의 풍속 값은 중복될 수 없습니다.", path: ["powerCurve"] });
+  }
+  if (turbine.powerCurve.some((point) => point.powerMW > turbine.ratedPowerMW)) {
+    context.addIssue({ code: "custom", message: "출력 곡선은 정격 용량을 초과할 수 없습니다.", path: ["powerCurve"] });
+  }
+  if (!turbine.powerCurve.some((point) => point.windSpeedMps === turbine.cutInMps && point.powerMW === 0) ||
+      !turbine.powerCurve.some((point) => point.windSpeedMps === turbine.ratedWindMps && point.powerMW === turbine.ratedPowerMW)) {
+    context.addIssue({ code: "custom", message: "출력 곡선에 컷인 풍속의 0 MW 점과 정격 풍속의 정격 출력 점이 필요합니다.", path: ["powerCurve"] });
+  }
+  const operatingCurve = [...turbine.powerCurve]
+    .filter((point) => point.windSpeedMps < turbine.cutOutMps)
+    .sort((first, second) => first.windSpeedMps - second.windSpeedMps);
+  if (operatingCurve.some((point, index) =>
+    (index > 0 && point.powerMW < operatingCurve[index - 1]!.powerMW) ||
+    (point.windSpeedMps <= turbine.cutInMps && point.powerMW !== 0) ||
+    (point.windSpeedMps >= turbine.ratedWindMps && point.powerMW !== turbine.ratedPowerMW)
+  ) || turbine.powerCurve.some((point) => point.windSpeedMps >= turbine.cutOutMps && point.powerMW !== 0)) {
+    context.addIssue({ code: "custom", message: "출력 곡선은 컷인부터 정격까지 증가하고, 정격부터 컷아웃 전까지 정격 출력을 유지해야 합니다.", path: ["powerCurve"] });
   }
 });
 
