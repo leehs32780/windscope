@@ -29,10 +29,11 @@ export function createDatabase(databaseUrl?: string): { client: DatabaseSync; db
     }
     if (method === "get") {
       const row = statement.get(...params);
-      return { rows: row ? [row] : [] };
+      // Drizzle's proxy adapter expects one ordered raw row for its `get` method.
+      return { rows: (row ? Object.values(row) : undefined) as unknown as unknown[] };
     }
-    const rows = statement.all(...params);
-    return { rows: method === "values" ? rows.map((row) => Object.values(row)) : rows };
+    const rows = statement.all(...params).map((row) => Object.values(row));
+    return { rows };
   }, { schema });
   return { client, db };
 }
