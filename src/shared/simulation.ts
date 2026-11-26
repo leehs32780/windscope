@@ -2,7 +2,8 @@ import type { PowerCurvePoint, SimulationInput, SimulationResult, TurbineInput, 
 import { normalizeDegrees, windFlowVector } from "./domain";
 import { simulationInputSchema } from "./validation";
 
-export const SIMULATION_MODEL_VERSION = "jensen-circle-overlap-rss-v1";
+export const SIMULATION_MODEL_VERSION = "jensen-circle-overlap-rss-v2";
+const DOWNWIND_TOLERANCE_M = 1e-7;
 
 function sortedCurve(points: PowerCurvePoint[]): PowerCurvePoint[] {
   return [...points].sort((a, b) => a.windSpeedMps - b.windSpeedMps);
@@ -13,7 +14,7 @@ export function powerAtWind(
   turbine: Pick<TurbineInput, "cutInMps" | "ratedWindMps" | "cutOutMps" | "ratedPowerMW" | "powerCurve">,
   airDensityKgM3 = 1.225
 ): number {
-  if (!Number.isFinite(windSpeedMps) || windSpeedMps < turbine.cutInMps || windSpeedMps >= turbine.cutOutMps) return 0;
+  if (!Number.isFinite(windSpeedMps) || windSpeedMps <= turbine.cutInMps || windSpeedMps >= turbine.cutOutMps) return 0;
   const densityRatio = Math.max(0, airDensityKgM3 / 1.225);
   if (windSpeedMps >= turbine.ratedWindMps) return Math.min(turbine.ratedPowerMW, turbine.ratedPowerMW * densityRatio);
 
@@ -62,16 +63,25 @@ function overlapRatio(wakeRadiusM: number, targetRadiusM: number, lateralOffsetM
   return Math.max(0, Math.min(1, circleIntersectionArea(wakeRadiusM, targetRadiusM, lateralOffsetM) / targetArea));
 }
 
+/** Shared centerline velocity deficit for calculation and the 3D wake legend/opacity. */
+export function wakeCenterDeficit(thrustCoefficient: number, wakeExpansion: number, rotorRadiusM: number, downwindM: number): number {
+  if (![thrustCoefficient, wakeExpansion, rotorRadiusM, downwindM].every(Number.isFinite) || rotorRadiusM <= 0 || downwindM < 0) return 0;
+  const ct = Math.max(0, Math.min(0.99, thrustCoefficient));
+  const expansion = 1 + (Math.max(0, wakeExpansion) * downwindM) / rotorRadiusM;
+  // Jensen/Park: expansion scales the initial deficit, not Ct inside the square root.
+  // https://wes.copernicus.org/articles/5/1601/2020/ (equation 6)
+  return (1 - Math.sqrt(1 - ct)) / (expansion * expansion);
+}
+
 function turbineWakeDeficit(source: TurbineInput, target: TurbineInput, downwindM: number, lateralM: number): number {
-  if (downwindM <= 0) return 0;
+  if (downwindM <= DOWNWIND_TOLERANCE_M) return 0;
   const sourceRadiusM = Math.max(0.1, source.rotorDiameterM / 2);
   const targetRadiusM = Math.max(0.1, target.rotorDiameterM / 2);
   const wakeRadiusM = sourceRadiusM + Math.max(0, source.wakeExpansion) * downwindM;
-  const overlap = overlapRatio(wakeRadiusM, targetRadiusM, lateralM);
+  const rotorCenterDistanceM = Math.hypot(lateralM, target.hubHeightM - source.hubHeightM);
+  const overlap = overlapRatio(wakeRadiusM, targetRadiusM, rotorCenterDistanceM);
   if (overlap <= 0) return 0;
-  const ct = Math.max(0, Math.min(0.99, source.thrustCoefficient));
-  const expansion = 1 + (Math.max(0, source.wakeExpansion) * downwindM) / sourceRadiusM;
-  const centerDeficit = 1 - Math.sqrt(Math.max(0, 1 - ct / (expansion * expansion)));
+  const centerDeficit = wakeCenterDeficit(source.thrustCoefficient, source.wakeExpansion, sourceRadiusM, downwindM);
   return centerDeficit * overlap;
 }
 
@@ -99,7 +109,7 @@ export function simulateFarm(input: SimulationInput): SimulationResult {
       const deltaEast = target.xM - source.xM;
       const deltaNorth = target.yM - source.yM;
       const downwindM = deltaEast * flow.east + deltaNorth * flow.north;
-      if (downwindM <= 0) continue;
+      if (downwindM <= DOWNWIND_TOLERANCE_M) continue;
       const lateralM = Math.abs(flow.east * deltaNorth - flow.north * deltaEast);
       const sourceResult = results.get(source.id);
       // 수동·정비 정지뿐 아니라 저풍속·강풍 보호 정지 터빈도 후류 원천으로 계산하지 않는다.
