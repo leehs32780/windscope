@@ -53,6 +53,27 @@ export type PlacementUpdate = {
 
 export type LayoutIssue = { turbineId: string; message: string; severity: "warning" | "error" };
 
+export type TurbineDefinitionInput = {
+  name: string;
+  ratedPowerMW: number;
+  rotorDiameterM: number;
+  hubHeightM: number;
+  cutInMps: number;
+  ratedWindMps: number;
+  cutOutMps: number;
+  thrustCoefficient: number;
+  wakeExpansion: number;
+  powerCurve: TurbineInput["powerCurve"];
+};
+
+export type TurbineCreateInput = TurbineDefinitionInput & { xM: number; yM: number };
+
+export type BaselinePromotion = {
+  baselineScenarioId: string;
+  experimentScenarioId: string;
+  archivedScenarioId?: string;
+};
+
 export class ApiRequestError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
     super(message);
@@ -103,6 +124,40 @@ export const api = {
   async getProject(projectId: string) {
     return (await apiRequest<DataEnvelope<FarmProject>>(`/projects/${encodeURIComponent(projectId)}`)).data;
   },
+  async createProject(input: { name: string; description?: string }) {
+    return (await apiRequest<DataEnvelope<FarmProject>>("/projects", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })).data;
+  },
+  async updateProject(projectId: string, input: { name?: string; description?: string | null }) {
+    return (await apiRequest<DataEnvelope<FarmProject>>(`/projects/${encodeURIComponent(projectId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    })).data;
+  },
+  async deleteProject(projectId: string) {
+    return (await apiRequest<DataEnvelope<{ deletedId: string; deletionPolicy: string }>>(`/projects/${encodeURIComponent(projectId)}`, {
+      method: "DELETE"
+    })).data;
+  },
+  async createTurbine(projectId: string, input: TurbineCreateInput) {
+    return (await apiRequest<DataEnvelope<unknown>>(`/projects/${encodeURIComponent(projectId)}/turbines`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    })).data;
+  },
+  async updateTurbine(projectId: string, turbineId: string, input: Partial<TurbineDefinitionInput>) {
+    return (await apiRequest<DataEnvelope<unknown>>(`/projects/${encodeURIComponent(projectId)}/turbines/${encodeURIComponent(turbineId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    })).data;
+  },
+  async deleteTurbine(projectId: string, turbineId: string) {
+    return (await apiRequest<DataEnvelope<unknown>>(`/projects/${encodeURIComponent(projectId)}/turbines/${encodeURIComponent(turbineId)}`, {
+      method: "DELETE"
+    })).data;
+  },
   async getScenario(scenarioId: string) {
     return (await apiRequest<DataEnvelope<FarmScenario>>(`/scenarios/${encodeURIComponent(scenarioId)}`)).data;
   },
@@ -139,6 +194,17 @@ export const api = {
     return (await apiRequest<DataEnvelope<FarmScenario>>(`/scenarios/${encodeURIComponent(scenarioId)}`, {
       method: "PATCH",
       body: JSON.stringify({ name })
+    })).data;
+  },
+  async deleteScenario(scenarioId: string) {
+    return (await apiRequest<DataEnvelope<{ deletedId: string; deletionPolicy: string }>>(`/scenarios/${encodeURIComponent(scenarioId)}`, {
+      method: "DELETE"
+    })).data;
+  },
+  async promoteBaseline(scenarioId: string) {
+    return (await apiRequest<DataEnvelope<BaselinePromotion>>(`/scenarios/${encodeURIComponent(scenarioId)}/promote-baseline`, {
+      method: "POST",
+      body: JSON.stringify({})
     })).data;
   },
   async resetLayout(scenarioId: string) {
