@@ -11,14 +11,17 @@ import {
   Gauge,
   MapPin,
   Move,
+  Plus,
   RotateCcw,
   Save,
+  Settings,
   Waves,
   Wind,
   Zap
 } from "lucide-react";
 import { api, resultForTurbine, statusLabel, type Comparison, type FarmProject, type FarmScenario, type ProjectSummary, type SimulationRun } from "./api";
 import { normalizeDegrees, validateLayout, type TurbineCommand, type TurbineInput } from "../shared/domain";
+import { ManagementDialog } from "./components/ManagementDialog";
 import "./styles.css";
 
 type WindDraft = { windSpeedMps: number; windDirectionDeg: number; airDensityKgM3: number };
@@ -243,7 +246,8 @@ function TurbineDetail({
   placementWarning,
   onSavePosition,
   onCommand,
-  onUndo
+  onUndo,
+  onDraftDirtyChange
 }: {
   turbine: TurbineInput | null;
   baselineTurbine?: TurbineInput;
@@ -255,6 +259,7 @@ function TurbineDetail({
   onSavePosition: (position: { xM: number; yM: number }) => void;
   onCommand: (command: TurbineCommand) => void;
   onUndo: () => void;
+  onDraftDirtyChange: (dirty: boolean) => void;
 }) {
   const [xText, setXText] = useState("");
   const [yText, setYText] = useState("");
@@ -263,6 +268,11 @@ function TurbineDetail({
     setXText(turbine ? String(turbine.xM) : "");
     setYText(turbine ? String(turbine.yM) : "");
   }, [turbine?.id, turbine?.xM, turbine?.yM]);
+  const coordinateDirty = Boolean(turbine && (xText !== String(turbine.xM) || yText !== String(turbine.yM)));
+  useEffect(() => {
+    onDraftDirtyChange(coordinateDirty);
+    return () => onDraftDirtyChange(false);
+  }, [coordinateDirty, onDraftDirtyChange]);
 
   if (!turbine) {
     return <section className="panel-section empty-detail"><div className="empty-detail__icon"><MapPin size={20} /></div><h2>발전기를 선택하세요</h2><p>3D 장면이나 아래 표에서 발전기를 누르면 상태와 예상 출력을 확인할 수 있습니다.</p></section>;
@@ -355,6 +365,7 @@ function SummaryAndTable({
   const capacityMW = scenario.turbines.reduce((sum, turbine) => sum + turbine.ratedPowerMW, 0);
   const utilization = result && capacityMW > 0 ? result.totalPowerMW / capacityMW * 100 : null;
   const resultById = new Map((result?.turbines ?? []).map((item) => [item.turbineId, item]));
+  const chartMaxMW = Math.max(1, ...(comparison?.turbineDeltas.flatMap((item) => [item.baselinePowerMW, item.experimentPowerMW]) ?? [1]));
 
   return (
     <>
@@ -389,6 +400,22 @@ function SummaryAndTable({
         </div>
         {comparison && <p className="comparison-definition">{comparison.comparisonDefinition} 기준: {comparison.baseline.name} · 현재: {comparison.experiment.name}</p>}
       </section>
+
+      <figure className="comparison-chart" aria-labelledby="comparison-chart-title">
+        <figcaption><span className="eyebrow">OUTPUT COMPARISON</span><h2 id="comparison-chart-title">터빈별 기준·현재 출력</h2><p>막대 길이는 MW를 나타내며 정확한 값은 아래 표에서도 확인할 수 있습니다.</p></figcaption>
+        <div className="comparison-chart__legend" aria-hidden="true"><span><i className="is-baseline" /> 기준</span><span><i className="is-current" /> 현재</span></div>
+        <div className="comparison-chart__plot">
+          {scenario.turbines.map((turbine) => {
+            const delta = comparison?.turbineDeltas.find((item) => item.turbineId === turbine.id);
+            return <button type="button" className={selectedTurbineId === turbine.id ? "comparison-chart__row is-selected" : "comparison-chart__row"} key={turbine.id} onClick={() => onSelect(turbine.id)}>
+              <strong>{turbine.name}</strong>
+              <span className="comparison-chart__bars" aria-hidden="true"><i className="is-baseline" style={{ width: `${(delta?.baselinePowerMW ?? 0) / chartMaxMW * 100}%` }} /><i className="is-current" style={{ width: `${(delta?.experimentPowerMW ?? 0) / chartMaxMW * 100}%` }} /></span>
+              <small>{formatSigned(delta?.deltaPowerMW)} MW</small>
+              <span className="sr-only">, 기준 {formatMw(delta?.baselinePowerMW)} MW, 현재 {formatMw(delta?.experimentPowerMW)} MW</span>
+            </button>;
+          })}
+        </div>
+      </figure>
 
       <section className="turbine-table-card">
         <div className="table-card-heading">
@@ -449,6 +476,8 @@ function App() {
   const [fitVersion, setFitVersion] = useState(0);
   const [resetVersion, setResetVersion] = useState(0);
   const [reloadVersion, setReloadVersion] = useState(0);
+  const [managementOpen, setManagementOpen] = useState(false);
+  const [coordinateDraftDirty, setCoordinateDraftDirty] = useState(false);
   const epochRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
 
@@ -485,7 +514,13 @@ function App() {
         const projectList = await api.getProjects();
         if (!alive) return;
         setProjects(projectList);
-        if (!projectList.length) throw new Error("프로젝트가 없습니다. DB 시드가 준비됐는지 확인해 주세요.");
+        if (!projectList.length) {
+          setProject(null);
+          setScenario(null);
+          setScenarioId("");
+          setLoading(false);
+          return;
+        }
         let remembered: { projectId?: string; scenarioId?: string } = {};
         try { remembered = JSON.parse(localStorage.getItem("windscope.selection") ?? "{}") ?? {}; } catch { /* Use the demo when browser storage is unavailable. */ }
         const firstProject = await api.getProject(projectList.find((item) => item.id === remembered.projectId)?.id ?? projectList[0]!.id);
@@ -786,6 +821,7 @@ function App() {
 
   async function switchProject(projectId: string) {
     if (interactionLocked) return;
+    if (!confirmDiscardDrafts()) return;
     setLoading(true);
     setError("");
     try {
@@ -800,6 +836,54 @@ function App() {
     }
   }
 
+  function confirmDiscardDrafts(): boolean {
+    const nameDirty = Boolean(scenario && scenarioNameDraft.trim() !== scenario.name);
+    if (!nameDirty && !coordinateDraftDirty) return true;
+    return window.confirm("저장하지 않은 이름 또는 좌표 입력이 있습니다. 변경을 버리고 이동할까요?");
+  }
+
+  function selectScenario(nextScenarioId: string) {
+    if (nextScenarioId === scenarioId || !confirmDiscardDrafts()) return;
+    setScenarioId(nextScenarioId);
+  }
+
+  function selectTurbine(nextTurbineId: string) {
+    if (nextTurbineId === selectedTurbineId || !confirmDiscardDrafts()) return;
+    setSelectedTurbineId(nextTurbineId);
+  }
+
+  async function refreshWorkspace(preferredProjectId?: string, preferredScenarioId?: string, message?: string) {
+    setLoading(true);
+    setError("");
+    setScenario(null);
+    setResult(null);
+    setComparison(null);
+    try {
+      const projectList = await api.getProjects();
+      setProjects(projectList);
+      const projectId = projectList.some((item) => item.id === preferredProjectId) ? preferredProjectId : projectList[0]?.id;
+      if (!projectId) {
+        setProject(null);
+        setScenario(null);
+        setScenarioId("");
+        if (message) setNotice(message);
+        return;
+      }
+      const nextProject = await api.getProject(projectId);
+      setProject(nextProject);
+      const nextScenario = nextProject.scenarios.find((item) => item.id === preferredScenarioId)
+        ?? nextProject.scenarios.find((item) => item.role === "experiment")
+        ?? nextProject.scenarios[0];
+      setScenarioId(nextScenario?.id ?? "");
+      setReloadVersion((value) => value + 1);
+      if (message) setNotice(message);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "프로젝트를 새로 불러오지 못했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function onPreviewMove(turbineId: string, position: { xM: number; yM: number }) {
     setPreviewPositions((current) => ({ ...current, [turbineId]: position }));
     setLayoutWarning("");
@@ -809,7 +893,7 @@ function App() {
     return <div className="loading-screen"><div className="loading-mark"><Wind size={25} /></div><strong>WindScope를 준비하고 있습니다</strong><span>샘플 단지와 시나리오를 불러오는 중</span><div className="loading-line"><i /></div></div>;
   }
   if (!project) {
-    return <div className="fatal-screen"><div className="brand-mark"><Wind size={20} /></div><h1>WindScope를 열지 못했습니다</h1><p>{error || "API 서버에 연결할 수 없습니다."}</p><ol><li>터미널에서 <code>npm run dev</code>가 실행 중인지 확인하세요.</li><li>SQLite 파일을 읽고 쓸 수 있는지 확인하세요.</li><li>오류가 계속되면 API 주소와 콘솔 메시지를 확인하세요.</li></ol></div>;
+    return <div className="empty-workspace"><div className="brand-mark"><Wind size={20} /></div><span className="eyebrow">WINDSCOPE WORKSPACE</span><h1>{error ? "WindScope를 열지 못했습니다" : "첫 해상풍력 프로젝트를 만드세요"}</h1><p>{error || "프로젝트 이름을 정한 다음 터빈을 추가하면 기준 배치와 실험 시나리오가 함께 준비됩니다."}</p>{error ? <ol><li>터미널에서 <code>npm run dev</code>가 실행 중인지 확인하세요.</li><li>SQLite 파일을 읽고 쓸 수 있는지 확인하세요.</li></ol> : null}<button type="button" className="button button--primary" onClick={() => setManagementOpen(true)}><Plus size={15} /> 새 프로젝트 만들기</button><ManagementDialog open={managementOpen} project={null} scenario={null} onClose={() => setManagementOpen(false)} onChanged={refreshWorkspace} /></div>;
   }
 
   const currentProject = project;
@@ -834,12 +918,13 @@ function App() {
           <span className="header-divider" />
           <label className="header-select-wrap header-select-wrap--scenario">
             <span>시나리오</span>
-            <select value={scenarioId} disabled={interactionLocked} onChange={(event) => setScenarioId(event.target.value)} aria-label="시나리오 선택">
+            <select value={scenarioId} disabled={interactionLocked} onChange={(event) => selectScenario(event.target.value)} aria-label="시나리오 선택">
               {currentProject.scenarios.map((item) => <option key={item.id} value={item.id}>{item.role === "baseline" ? "기준 · " : "실험 · "}{item.name}</option>)}
             </select><ChevronDown size={13} />
           </label>
           <span className={`save-pill save-pill--${saveState}`}><i />{saveLabel}</span>
           <button type="button" className="header-action" onClick={() => void duplicateScenario()} disabled={interactionLocked || !scenario} title="현재 시나리오 복제"><Copy size={15} /><span>실험 복제</span></button>
+          <button type="button" className="header-action" onClick={() => setManagementOpen(true)} disabled={interactionLocked} title="프로젝트와 터빈 관리"><Settings size={15} /><span>관리</span></button>
         </div>
         <a className="header-help" href="#model-assumptions" aria-label="모델 가정 보기"><CircleHelp size={16} /><span>모델 가정</span></a>
       </header>
@@ -886,7 +971,12 @@ function App() {
               <span className="camera-label">궤도 카메라</span>
             </div>
           </div>
-          {scenario ? <Suspense fallback={<div className="scene-loading"><div className="loading-line"><i /></div><span>3D 장면을 준비하고 있습니다.</span></div>}><FarmScene
+          {scenario ? scenario.turbines.length === 0 ? <div className="empty-farm" role="status">
+            <div className="empty-farm__icon"><Wind size={24} /></div>
+            <h2>첫 터빈을 추가해 단지를 구성하세요</h2>
+            <p>사양과 좌표를 입력하면 모든 시나리오에 같은 터빈이 추가되고 3D 배치와 출력 계산이 준비됩니다.</p>
+            <button type="button" className="button button--primary" onClick={() => setManagementOpen(true)}><Plus size={15} /> 터빈 추가</button>
+          </div> : <Suspense fallback={<div className="scene-loading"><div className="loading-line"><i /></div><span>3D 장면을 준비하고 있습니다.</span></div>}><FarmScene
             turbines={scenario.turbines}
             results={visibleResult?.turbines ?? []}
             windSpeedMps={draft.windSpeedMps}
@@ -894,7 +984,7 @@ function App() {
             selectedTurbineId={selectedTurbineId}
             editMode={editMode && editable && !interactionLocked}
             previewPositions={previewPositions}
-            onSelect={(id) => { if (id) setSelectedTurbineId(id); }}
+            onSelect={(id) => { if (id) selectTurbine(id); }}
             onHover={() => undefined}
             onPreviewMove={onPreviewMove}
             onCommitMove={(id, position) => void commitPlacement(id, position)}
@@ -909,7 +999,7 @@ function App() {
             onComparisonMode={(mode) => void changeComparisonMode(mode)}
             disabled={interactionLocked}
             selectedTurbineId={selectedTurbineId}
-            onSelect={setSelectedTurbineId}
+            onSelect={selectTurbine}
           />
         </section>
 
@@ -931,6 +1021,7 @@ function App() {
             onSavePosition={(position) => void commitPlacement(selectedTurbine!.id, position)}
             onCommand={(command) => void changeTurbineCommand(command)}
             onUndo={() => void undoPlacement()}
+            onDraftDirtyChange={setCoordinateDraftDirty}
           />
           <div className="assumptions-mini" id="model-assumptions">
             <div className="assumptions-mini__title"><CircleHelp size={15} /><strong>계산 가정</strong></div>
@@ -948,6 +1039,7 @@ function App() {
       </main>
 
       <footer className="app-footer"><span>WindScope <i /> 교육·설계 검토용 추정 도구</span><span>출력 MW · 풍속 m/s · 위치 m · 풍향 deg</span></footer>
+      <ManagementDialog open={managementOpen} project={project} scenario={scenario} onClose={() => setManagementOpen(false)} onChanged={refreshWorkspace} />
     </div>
   );
 }
