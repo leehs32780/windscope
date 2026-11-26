@@ -5,6 +5,10 @@ import { applyMigrations, createDatabase } from "./db/client";
 import { seedDemoFarm } from "./db/seed";
 import type { WindScopeDatabase } from "./db/client";
 import type { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SIMULATION_MODEL_VERSION } from "../shared/simulation";
 
 describe("WindScope API", () => {
   let db: WindScopeDatabase;
@@ -21,6 +25,24 @@ describe("WindScope API", () => {
   });
 
   afterEach(() => client.close());
+
+  it("isolates layout effects under identical weather and commands without mutating the baseline", async () => {
+    await request(app).patch("/api/scenarios/north-sea-experiment/settings").send({ windSpeedMps: 13, windDirectionDeg: 90 }).expect(200);
+    await request(app).put("/api/scenarios/north-sea-experiment/turbines/north-sea-turbine-01").send({ command: "manual_stop" }).expect(200);
+    const layout = (await request(app).get("/api/scenarios/north-sea-experiment/compare?against=north-sea-baseline&mode=layout").expect(200)).body.data;
+    expect(layout.mode).toBe("layout");
+    expect(layout.conditionsDiffer).toBe(false);
+    expect(layout.deltaPowerMW).toBeCloseTo(0, 10);
+    expect(layout.turbineDeltas).toHaveLength(12);
+    expect(layout.turbineDeltas[0]).toMatchObject({ baselinePowerMW: 0, experimentPowerMW: 0 });
+    const whole = (await request(app).get("/api/scenarios/north-sea-experiment/compare?against=north-sea-baseline&mode=scenario").expect(200)).body.data;
+    expect(whole.conditionsDiffer).toBe(true);
+    expect(whole.deltaPowerMW).not.toBe(0);
+    const baseline = (await request(app).get("/api/scenarios/north-sea-baseline").expect(200)).body.data;
+    expect(baseline.windSpeedMps).toBe(9.5);
+    expect(baseline.turbines[0].command).toBe("operational");
+    await request(app).get("/api/scenarios/north-sea-experiment/compare?against=north-sea-baseline&mode=invalid").expect(400);
+  });
 
   it("reports the API/database and returns the seeded project with scenarios", async () => {
     const health = await request(app).get("/api/health").expect(200);
@@ -50,7 +72,7 @@ describe("WindScope API", () => {
     const simulated = await request(app).post("/api/scenarios/north-sea-experiment/simulate").send({}).expect(200);
     expect(simulated.body.data.totalPowerMW).toBeGreaterThan(0);
     expect(simulated.body.data.wakeLossPercent).not.toBeNull();
-    expect(simulated.body.data.modelVersion).toBe("jensen-circle-overlap-rss-v1");
+    expect(simulated.body.data.modelVersion).toBe(SIMULATION_MODEL_VERSION);
 
     const latest = await request(app).get("/api/scenarios/north-sea-experiment/results/latest").expect(200);
     expect(latest.body.data.id).toBe(simulated.body.data.runId);
@@ -62,7 +84,8 @@ describe("WindScope API", () => {
       .expect(200);
     expect(comparison.body.data.baseline.scenarioId).toBe("north-sea-baseline");
     expect(typeof comparison.body.data.deltaPowerMW).toBe("number");
-    expect(comparison.body.data.comparisonDefinition).toContain("현재 실험 총 출력");
+    expect(comparison.body.data.mode).toBe("scenario");
+    expect(comparison.body.data.deltaPowerMW).toBeCloseTo(comparison.body.data.experiment.totalPowerMW - comparison.body.data.baseline.totalPowerMW, 10);
   });
 
   it("duplicates settings and layout without changing the baseline or source experiment", async () => {
@@ -106,6 +129,46 @@ describe("WindScope API", () => {
     expect(response.body.data.scenarios).toHaveLength(2);
     expect(response.body.data.baselineScenarioId).toBeTruthy();
     expect(response.body.data.turbines).toHaveLength(0);
+  });
+
+  it("compares fresh scenarios before any saved run without overlapping SQLite transactions", async () => {
+    const comparison = await request(app).get("/api/scenarios/north-sea-experiment/compare")
+      .query({ against: "north-sea-baseline" }).expect(200);
+    expect(comparison.body.data.deltaPowerMW).toBe(0);
+    expect(client.prepare("SELECT COUNT(*) AS count FROM simulation_runs").get()?.count).toBe(2);
+    expect(client.prepare("SELECT COUNT(*) AS count FROM turbine_simulation_results").get()?.count).toBe(24);
+  });
+
+  it("marks obsolete results and recalculates comparison from the current settings", async () => {
+    await request(app).post("/api/scenarios/north-sea-experiment/simulate").send({}).expect(200);
+    await request(app).patch("/api/scenarios/north-sea-experiment/settings").send({ windSpeedMps: 0 }).expect(200);
+    const stale = await request(app).get("/api/scenarios/north-sea-experiment/results/latest").expect(200);
+    expect(stale.body.data.isStale).toBe(true);
+    const comparison = await request(app).get("/api/scenarios/north-sea-experiment/compare")
+      .query({ against: "north-sea-baseline" }).expect(200);
+    expect(comparison.body.data.experiment.totalPowerMW).toBe(0);
+    const latest = await request(app).get("/api/scenarios/north-sea-experiment/results/latest").expect(200);
+    expect(latest.body.data.isStale).toBe(false);
+  });
+
+  it("returns client errors for malformed JSON and oversized bodies", async () => {
+    const malformed = await request(app).post("/api/projects").set("Content-Type", "application/json").send('{"name":').expect(400);
+    expect(malformed.body.error.code).toBe("INVALID_JSON");
+    const oversized = await request(app).post("/api/projects").send({ name: "x".repeat(110_000) }).expect(413);
+    expect(oversized.body.error.code).toBe("PAYLOAD_TOO_LARGE");
+  });
+
+  it("serves the production root and client routes, but keeps missing assets as 404", async () => {
+    const buildDirectory = mkdtempSync(join(tmpdir(), "windscope-static-"));
+    try {
+      writeFileSync(join(buildDirectory, "index.html"), '<main id="root">WindScope production</main>');
+      const productionApp = createApp(db, buildDirectory);
+      expect((await request(productionApp).get("/").expect(200)).text).toContain("WindScope production");
+      expect((await request(productionApp).get("/scenario/demo").expect(200)).text).toContain("WindScope production");
+      await request(productionApp).get("/assets/missing.js").expect(404);
+    } finally {
+      rmSync(buildDirectory, { recursive: true, force: true });
+    }
   });
 });
 

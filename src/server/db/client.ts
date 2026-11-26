@@ -4,6 +4,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { drizzle, type SqliteRemoteDatabase } from "drizzle-orm/sqlite-proxy";
 import { projects, scenarios, scenarioTurbines, simulationRuns, turbineSimulationResults, turbines } from "./schema";
+import { withDatabaseAccess } from "./access";
 
 const schema = { projects, turbines, scenarios, scenarioTurbines, simulationRuns, turbineSimulationResults };
 
@@ -21,7 +22,9 @@ export function createDatabase(databaseUrl?: string): { client: DatabaseSync; db
   const client = new DatabaseSync(databasePath);
   client.exec("PRAGMA foreign_keys = ON;");
   client.exec("PRAGMA journal_mode = WAL;");
-  const db = drizzle(async (query, params, method) => {
+  client.exec("PRAGMA busy_timeout = 5000;");
+  let db: WindScopeDatabase;
+  db = drizzle((query, params, method) => withDatabaseAccess(db, () => {
     const statement = client.prepare(query);
     if (method === "run") {
       statement.run(...params);
@@ -34,7 +37,11 @@ export function createDatabase(databaseUrl?: string): { client: DatabaseSync; db
     }
     const rows = statement.all(...params).map((row) => Object.values(row));
     return { rows };
-  }, { schema });
+  }), { schema });
+  // sqlite-proxy yields between BEGIN and COMMIT. Without this lock two HTTP
+  // requests can nest BEGINs, or another request's write can join a transaction.
+  const originalTransaction = db.transaction.bind(db);
+  db.transaction = (operation, config) => withDatabaseAccess(db, () => originalTransaction(operation, config));
   return { client, db };
 }
 

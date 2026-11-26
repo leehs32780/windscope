@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { PowerCurvePoint, SimulationInput, SimulationResult, TurbineInput } from "../shared/domain";
 import { validateLayout } from "../shared/domain";
 import { powerCurvePointSchema } from "../shared/validation";
-import { simulateFarm } from "../shared/simulation";
+import { SIMULATION_MODEL_VERSION, simulateFarm } from "../shared/simulation";
 import type { WindScopeDatabase } from "./db/client";
+import { withDatabaseAccess } from "./db/access";
 import { projects, scenarios, scenarioTurbines, simulationRuns, turbineSimulationResults, turbines } from "./db/schema";
 import { ApiError, conflict, notFound } from "./http-error";
 
@@ -20,14 +21,14 @@ function parsePowerCurve(value: string): PowerCurvePoint[] {
   return parsed.data;
 }
 
-export async function listProjects(db: WindScopeDatabase) {
+async function listProjectsImpl(db: WindScopeDatabase) {
   return db.select({ id: projects.id, name: projects.name, description: projects.description })
     .from(projects)
     .orderBy(asc(projects.createdAt))
     .all();
 }
 
-export async function createProject(db: WindScopeDatabase, input: { name: string; description?: string }) {
+async function createProjectImpl(db: WindScopeDatabase, input: { name: string; description?: string }) {
   const projectId = randomUUID();
   const baselineId = randomUUID();
   const experimentId = randomUUID();
@@ -42,7 +43,7 @@ export async function createProject(db: WindScopeDatabase, input: { name: string
   return getProject(db, projectId);
 }
 
-export async function getProject(db: WindScopeDatabase, projectId: string) {
+async function getProjectImpl(db: WindScopeDatabase, projectId: string) {
   const project = await db.select().from(projects).where(eq(projects.id, projectId)).get();
   if (!project) notFound("프로젝트를 찾을 수 없습니다.");
   const [projectTurbines, projectScenarios] = await Promise.all([
@@ -57,7 +58,7 @@ export async function getProject(db: WindScopeDatabase, projectId: string) {
   };
 }
 
-export async function listProjectTurbines(db: WindScopeDatabase, projectId: string) {
+async function listProjectTurbinesImpl(db: WindScopeDatabase, projectId: string) {
   const project = await db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).get();
   if (!project) notFound("프로젝트를 찾을 수 없습니다.");
   const rows = await db.select().from(turbines).where(eq(turbines.projectId, projectId)).orderBy(asc(turbines.displayOrder)).all();
@@ -70,7 +71,7 @@ async function requireScenario(db: WindScopeDatabase, scenarioId: string) {
   return scenario;
 }
 
-export async function getScenario(db: WindScopeDatabase, scenarioId: string) {
+async function getScenarioImpl(db: WindScopeDatabase, scenarioId: string) {
   const scenario = await requireScenario(db, scenarioId);
   const placements = await db.select({
     id: turbines.id,
@@ -103,7 +104,7 @@ export async function getScenario(db: WindScopeDatabase, scenarioId: string) {
   };
 }
 
-export async function createExperimentScenario(
+async function createExperimentScenarioImpl(
   db: WindScopeDatabase,
   projectId: string,
   name: string,
@@ -145,14 +146,14 @@ export async function createExperimentScenario(
   return getScenario(db, scenarioId);
 }
 
-export async function renameScenario(db: WindScopeDatabase, scenarioId: string, name: string) {
+async function renameScenarioImpl(db: WindScopeDatabase, scenarioId: string, name: string) {
   const scenario = await requireScenario(db, scenarioId);
   if (scenario.role === "baseline") conflict("기준 시나리오는 이름을 바꿀 수 없습니다.");
   await db.update(scenarios).set({ name, updatedAt: new Date().toISOString() }).where(eq(scenarios.id, scenarioId)).run();
   return getScenario(db, scenarioId);
 }
 
-export async function updateScenarioSettings(
+async function updateScenarioSettingsImpl(
   db: WindScopeDatabase,
   scenarioId: string,
   settings: Partial<Pick<typeof scenarios.$inferSelect, "windSpeedMps" | "windDirectionDeg" | "airDensityKgM3">>
@@ -168,7 +169,7 @@ export async function updateScenarioSettings(
   return getScenario(db, scenarioId);
 }
 
-export async function updateTurbinePlacement(
+async function updateTurbinePlacementImpl(
   db: WindScopeDatabase,
   scenarioId: string,
   turbineId: string,
@@ -186,16 +187,20 @@ export async function updateTurbinePlacement(
   const layoutIssues = validateLayout(nextTurbines);
   const errors = layoutIssues.filter((issue) => issue.severity === "error");
   if (errors.length > 0) conflict(errors[0]!.message);
-  await db.update(scenarioTurbines).set({
-    xM: update.xM ?? target.xM,
-    yM: update.yM ?? target.yM,
-    command: update.command ?? target.command,
-    updatedAt: new Date().toISOString()
-  }).where(and(eq(scenarioTurbines.scenarioId, scenarioId), eq(scenarioTurbines.turbineId, turbineId))).run();
+  const updatedAt = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx.update(scenarioTurbines).set({
+      xM: update.xM ?? target.xM,
+      yM: update.yM ?? target.yM,
+      command: update.command ?? target.command,
+      updatedAt
+    }).where(and(eq(scenarioTurbines.scenarioId, scenarioId), eq(scenarioTurbines.turbineId, turbineId))).run();
+    await tx.update(scenarios).set({ updatedAt }).where(eq(scenarios.id, scenarioId)).run();
+  });
   return { scenario: await getScenario(db, scenarioId), layoutIssues };
 }
 
-export async function resetScenarioLayout(db: WindScopeDatabase, scenarioId: string) {
+async function resetScenarioLayoutImpl(db: WindScopeDatabase, scenarioId: string) {
   const scenario = await requireScenario(db, scenarioId);
   if (scenario.role === "baseline") conflict("기준 배치는 읽기 전용입니다.");
   const baseline = await db.select().from(scenarios)
@@ -216,6 +221,7 @@ export async function resetScenarioLayout(db: WindScopeDatabase, scenarioId: str
         updatedAt: now
       }))).run();
     }
+    await tx.update(scenarios).set({ updatedAt: now }).where(eq(scenarios.id, scenarioId)).run();
   });
   return getScenario(db, scenarioId);
 }
@@ -245,13 +251,17 @@ function toSimulationInput(scenario: Awaited<ReturnType<typeof getScenario>>): S
   };
 }
 
-export async function runScenarioSimulation(db: WindScopeDatabase, scenarioId: string) {
+function snapshotInput(input: SimulationInput) {
+  const stableInput = { ...input, turbines: [...input.turbines].sort((first, second) => first.id.localeCompare(second.id)) };
+  const inputJson = JSON.stringify(stableInput);
+  return { inputJson, inputHash: createHash("sha256").update(inputJson).digest("hex") };
+}
+
+async function runScenarioSimulationImpl(db: WindScopeDatabase, scenarioId: string) {
   const scenario = await getScenario(db, scenarioId);
   const input = toSimulationInput(scenario);
   const result: SimulationResult = simulateFarm(input);
-  const stableInput = { ...input, turbines: [...input.turbines].sort((first, second) => first.id.localeCompare(second.id)) };
-  const inputJson = JSON.stringify(stableInput);
-  const inputHash = createHash("sha256").update(inputJson).digest("hex");
+  const { inputJson, inputHash } = snapshotInput(input);
   const runId = randomUUID();
   const calculatedAt = new Date().toISOString();
   await db.transaction(async (tx) => {
@@ -283,19 +293,23 @@ export async function runScenarioSimulation(db: WindScopeDatabase, scenarioId: s
   return { ...result, runId, inputHash, calculatedAt };
 }
 
-export async function getLatestSimulation(db: WindScopeDatabase, scenarioId: string) {
-  await requireScenario(db, scenarioId);
+async function getLatestSimulationImpl(db: WindScopeDatabase, scenarioId: string) {
+  const scenario = await getScenario(db, scenarioId);
   const run = await db.select().from(simulationRuns)
     .where(eq(simulationRuns.scenarioId, scenarioId))
-    .orderBy(desc(simulationRuns.calculatedAt))
+    .orderBy(desc(simulationRuns.calculatedAt), desc(sql`rowid`))
     .limit(1)
     .get();
   if (!run) return null;
   const results = await db.select().from(turbineSimulationResults)
     .where(eq(turbineSimulationResults.simulationRunId, run.id))
     .all();
+  const currentInputHash = snapshotInput(toSimulationInput(scenario)).inputHash;
   return {
     ...run,
+    runId: run.id,
+    currentInputHash,
+    isStale: run.inputHash !== currentInputHash || run.modelVersion !== SIMULATION_MODEL_VERSION,
     turbines: results.map((result) => ({
       ...result,
       upstreamTurbineIds: JSON.parse(result.upstreamTurbineIdsJson) as string[]
@@ -303,26 +317,59 @@ export async function getLatestSimulation(db: WindScopeDatabase, scenarioId: str
   };
 }
 
-export async function compareScenarioToBaseline(db: WindScopeDatabase, scenarioId: string, baselineScenarioId: string) {
-  const scenario = await requireScenario(db, scenarioId);
-  const baseline = await requireScenario(db, baselineScenarioId);
+async function compareScenarioToBaselineImpl(db: WindScopeDatabase, scenarioId: string, baselineScenarioId: string, mode: "layout" | "scenario" = "scenario") {
+  const scenario = await getScenario(db, scenarioId);
+  const baseline = await getScenario(db, baselineScenarioId);
   if (baseline.role !== "baseline") conflict("비교 대상은 기준 시나리오여야 합니다.");
   if (baseline.projectId !== scenario.projectId) conflict("다른 프로젝트의 시나리오는 비교할 수 없습니다.");
   const [baselineRun, experimentRun] = await Promise.all([
     getLatestSimulation(db, baselineScenarioId),
     getLatestSimulation(db, scenarioId)
   ]);
-  const [baselineResult, experimentResult] = await Promise.all([
-    baselineRun ?? runScenarioSimulation(db, baselineScenarioId),
-    experimentRun ?? runScenarioSimulation(db, scenarioId)
-  ]);
+  const experimentResult = experimentRun && !experimentRun.isStale ? experimentRun : await runScenarioSimulation(db, scenarioId);
+  const conditions = (value: typeof scenario) => ({ windSpeedMps: value.windSpeedMps, windDirectionDeg: value.windDirectionDeg, airDensityKgM3: value.airDensityKgM3 });
+  const experimentConditions = conditions(scenario);
+  const baselineConditions = mode === "layout" ? experimentConditions : conditions(baseline);
+  const commands = new Map(scenario.turbines.map((turbine) => [turbine.id, turbine.command]));
+  // Layout comparison is transient: use identical weather/commands while keeping
+  // baseline coordinates and preserving the immutable baseline in the database.
+  const baselineResult = mode === "layout"
+    ? simulateFarm({ ...toSimulationInput(baseline), ...experimentConditions, turbines: toSimulationInput(baseline).turbines.map((turbine) => ({ ...turbine, command: commands.get(turbine.id) ?? turbine.command })) })
+    : baselineRun && !baselineRun.isStale ? baselineRun : await runScenarioSimulation(db, baselineScenarioId);
   const deltaPowerMW = experimentResult.totalPowerMW - baselineResult.totalPowerMW;
   return {
-    baseline: { scenarioId: baseline.id, name: baseline.name, totalPowerMW: baselineResult.totalPowerMW, wakeLossMW: baselineResult.wakeLossMW, wakeLossPercent: baselineResult.wakeLossPercent },
-    experiment: { scenarioId: scenario.id, name: scenario.name, totalPowerMW: experimentResult.totalPowerMW, wakeLossMW: experimentResult.wakeLossMW, wakeLossPercent: experimentResult.wakeLossPercent },
+    mode,
+    conditionsDiffer: JSON.stringify(baselineConditions) !== JSON.stringify(experimentConditions),
+    baseline: { scenarioId: baseline.id, name: baseline.name, conditions: baselineConditions, totalPowerMW: baselineResult.totalPowerMW, wakeLossMW: baselineResult.wakeLossMW, wakeLossPercent: baselineResult.wakeLossPercent },
+    experiment: { scenarioId: scenario.id, name: scenario.name, conditions: experimentConditions, totalPowerMW: experimentResult.totalPowerMW, wakeLossMW: experimentResult.wakeLossMW, wakeLossPercent: experimentResult.wakeLossPercent },
+    turbineDeltas: scenario.turbines.map((turbine) => {
+      const baselinePowerMW = baselineResult.turbines.find((item) => item.turbineId === turbine.id)?.powerMW ?? 0;
+      const experimentPowerMW = experimentResult.turbines.find((item) => item.turbineId === turbine.id)?.powerMW ?? 0;
+      return { turbineId: turbine.id, name: turbine.name, baselinePowerMW, experimentPowerMW, deltaPowerMW: experimentPowerMW - baselinePowerMW };
+    }),
     deltaPowerMW,
     deltaPowerPercent: baselineResult.totalPowerMW > 0 ? (deltaPowerMW / baselineResult.totalPowerMW) * 100 : null,
-    comparisonDefinition: "현재 실험 총 출력 - 기준 시나리오 총 출력. 후류 손실률은 각 시나리오의 무후류 예상 출력을 분모로 계산합니다."
+    comparisonDefinition: `${mode === "layout" ? "동일한 풍황·운전 명령에서 현재 배치 출력 - 기준 배치 출력." : "각 시나리오에 저장된 전체 조건에서 현재 출력 - 기준 출력."} 후류 손실률은 각각의 무후류 예상 출력을 분모로 계산합니다.`
   };
 }
+
+// A service operation may read, validate, and then write multiple rows. Keep
+// that whole sequence together, including comparisons and their recalculation.
+function serialize<Args extends unknown[], Result>(operation: (db: WindScopeDatabase, ...args: Args) => Promise<Result>) {
+  return (db: WindScopeDatabase, ...args: Args): Promise<Result> => withDatabaseAccess(db, () => operation(db, ...args));
+}
+
+export const listProjects = serialize(listProjectsImpl);
+export const createProject = serialize(createProjectImpl);
+export const getProject = serialize(getProjectImpl);
+export const listProjectTurbines = serialize(listProjectTurbinesImpl);
+export const getScenario = serialize(getScenarioImpl);
+export const createExperimentScenario = serialize(createExperimentScenarioImpl);
+export const renameScenario = serialize(renameScenarioImpl);
+export const updateScenarioSettings = serialize(updateScenarioSettingsImpl);
+export const updateTurbinePlacement = serialize(updateTurbinePlacementImpl);
+export const resetScenarioLayout = serialize(resetScenarioLayoutImpl);
+export const runScenarioSimulation = serialize(runScenarioSimulationImpl);
+export const getLatestSimulation = serialize(getLatestSimulationImpl);
+export const compareScenarioToBaseline = serialize(compareScenarioToBaselineImpl);
 
