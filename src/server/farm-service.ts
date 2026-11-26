@@ -2,12 +2,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { PowerCurvePoint, SimulationInput, SimulationResult, TurbineInput } from "../shared/domain";
 import { validateLayout } from "../shared/domain";
-import { powerCurvePointSchema } from "../shared/validation";
+import { powerCurvePointSchema, turbineInputSchema } from "../shared/validation";
 import { SIMULATION_MODEL_VERSION, simulateFarm } from "../shared/simulation";
 import type { WindScopeDatabase } from "./db/client";
 import { withDatabaseAccess } from "./db/access";
 import { projects, scenarios, scenarioTurbines, simulationRuns, turbineSimulationResults, turbines } from "./db/schema";
 import { ApiError, conflict, notFound } from "./http-error";
+import { farmRepository } from "./repositories/farm-repository";
+
+type TurbineSpecification = Pick<TurbineInput,
+  "name" | "ratedPowerMW" | "rotorDiameterM" | "hubHeightM" | "cutInMps" |
+  "ratedWindMps" | "cutOutMps" | "thrustCoefficient" | "wakeExpansion" | "powerCurve"
+>;
+type TurbineCreateInput = TurbineSpecification & { xM: number; yM: number; displayOrder?: number };
+type TurbineUpdateInput = Partial<TurbineSpecification & { displayOrder: number }>;
 
 function parsePowerCurve(value: string): PowerCurvePoint[] {
   let decoded: unknown;
@@ -22,10 +30,7 @@ function parsePowerCurve(value: string): PowerCurvePoint[] {
 }
 
 async function listProjectsImpl(db: WindScopeDatabase) {
-  return db.select({ id: projects.id, name: projects.name, description: projects.description })
-    .from(projects)
-    .orderBy(asc(projects.createdAt))
-    .all();
+  return farmRepository(db).listProjects();
 }
 
 async function createProjectImpl(db: WindScopeDatabase, input: { name: string; description?: string }) {
@@ -43,12 +48,26 @@ async function createProjectImpl(db: WindScopeDatabase, input: { name: string; d
   return getProject(db, projectId);
 }
 
+async function updateProjectImpl(db: WindScopeDatabase, projectId: string, input: { name?: string; description?: string | null }) {
+  const repository = farmRepository(db);
+  const project = await repository.findProject(projectId);
+  if (!project) notFound("수정할 프로젝트를 찾을 수 없습니다.");
+  const now = new Date().toISOString();
+  await db.update(projects).set({
+    name: input.name ?? project.name,
+    description: input.description === undefined ? project.description : input.description || null,
+    updatedAt: now
+  }).where(eq(projects.id, projectId)).run();
+  return getProject(db, projectId);
+}
+
 async function getProjectImpl(db: WindScopeDatabase, projectId: string) {
-  const project = await db.select().from(projects).where(eq(projects.id, projectId)).get();
+  const repository = farmRepository(db);
+  const project = await repository.findProject(projectId);
   if (!project) notFound("프로젝트를 찾을 수 없습니다.");
   const [projectTurbines, projectScenarios] = await Promise.all([
-    db.select().from(turbines).where(eq(turbines.projectId, projectId)).orderBy(asc(turbines.displayOrder)).all(),
-    db.select().from(scenarios).where(eq(scenarios.projectId, projectId)).orderBy(asc(scenarios.createdAt)).all()
+    repository.listProjectTurbines(projectId),
+    repository.listProjectScenarios(projectId)
   ]);
   return {
     ...project,
@@ -59,14 +78,15 @@ async function getProjectImpl(db: WindScopeDatabase, projectId: string) {
 }
 
 async function listProjectTurbinesImpl(db: WindScopeDatabase, projectId: string) {
-  const project = await db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).get();
+  const repository = farmRepository(db);
+  const project = await repository.findProject(projectId);
   if (!project) notFound("프로젝트를 찾을 수 없습니다.");
-  const rows = await db.select().from(turbines).where(eq(turbines.projectId, projectId)).orderBy(asc(turbines.displayOrder)).all();
+  const rows = await repository.listProjectTurbines(projectId);
   return rows.map((turbine) => ({ ...turbine, powerCurve: parsePowerCurve(turbine.powerCurveJson) }));
 }
 
 async function requireScenario(db: WindScopeDatabase, scenarioId: string) {
-  const scenario = await db.select().from(scenarios).where(eq(scenarios.id, scenarioId)).get();
+  const scenario = await farmRepository(db).findScenario(scenarioId);
   if (!scenario) notFound("시나리오를 찾을 수 없습니다.");
   return scenario;
 }
@@ -226,6 +246,226 @@ async function resetScenarioLayoutImpl(db: WindScopeDatabase, scenarioId: string
   return getScenario(db, scenarioId);
 }
 
+async function deleteProjectImpl(db: WindScopeDatabase, projectId: string) {
+  const repository = farmRepository(db);
+  const project = await repository.findProject(projectId);
+  if (!project) notFound("삭제할 프로젝트를 찾을 수 없습니다.");
+  await repository.deleteProject(projectId);
+  return {
+    deletedId: projectId,
+    deletionPolicy: "프로젝트와 연결된 터빈, 시나리오, 배치 및 저장된 시뮬레이션 결과를 함께 삭제합니다."
+  };
+}
+
+async function deleteScenarioImpl(db: WindScopeDatabase, scenarioId: string) {
+  const repository = farmRepository(db);
+  const scenario = await repository.findScenario(scenarioId);
+  if (!scenario) notFound("삭제할 시나리오를 찾을 수 없습니다.");
+  if (scenario.role === "baseline") conflict("기준 시나리오는 삭제할 수 없습니다. 다른 실험을 새 기준으로 지정한 뒤에도 기준 레코드는 보존됩니다.");
+  await repository.deleteScenario(scenarioId);
+  await db.update(projects).set({ updatedAt: new Date().toISOString() }).where(eq(projects.id, scenario.projectId)).run();
+  return {
+    deletedId: scenarioId,
+    project: await getProject(db, scenario.projectId),
+    deletionPolicy: "실험 시나리오와 연결된 배치 및 저장된 시뮬레이션 결과를 함께 삭제합니다."
+  };
+}
+
+async function createTurbineImpl(db: WindScopeDatabase, projectId: string, input: TurbineCreateInput) {
+  const repository = farmRepository(db);
+  const project = await repository.findProject(projectId);
+  if (!project) notFound("터빈을 추가할 프로젝트를 찾을 수 없습니다.");
+  const [projectTurbines, projectScenarios] = await Promise.all([
+    repository.listProjectTurbines(projectId),
+    repository.listProjectScenarios(projectId)
+  ]);
+  if (projectTurbines.length >= 100) conflict("한 프로젝트에는 최대 100대의 터빈을 추가할 수 있습니다.");
+  if (projectTurbines.some((turbine) => turbine.name === input.name)) conflict("같은 프로젝트에 동일한 터빈 이름을 사용할 수 없습니다.");
+  const turbineId = randomUUID();
+  const validated = turbineInputSchema.parse({ ...input, id: turbineId, command: "operational" });
+  for (const scenario of projectScenarios) {
+    const detail = await getScenarioImpl(db, scenario.id);
+    const issue = validateLayout([...detail.turbines, validated]).find((item) => item.severity === "error");
+    if (issue) conflict(`${scenario.name}: ${issue.message}`);
+  }
+  const now = new Date().toISOString();
+  const displayOrder = input.displayOrder ?? (projectTurbines.reduce((maximum, turbine) => Math.max(maximum, turbine.displayOrder), -1) + 1);
+  await db.transaction(async (tx) => {
+    await tx.insert(turbines).values({
+      id: turbineId,
+      projectId,
+      name: validated.name,
+      ratedPowerMW: validated.ratedPowerMW,
+      rotorDiameterM: validated.rotorDiameterM,
+      hubHeightM: validated.hubHeightM,
+      cutInMps: validated.cutInMps,
+      ratedWindMps: validated.ratedWindMps,
+      cutOutMps: validated.cutOutMps,
+      thrustCoefficient: validated.thrustCoefficient,
+      wakeExpansion: validated.wakeExpansion,
+      powerCurveJson: JSON.stringify(validated.powerCurve),
+      displayOrder,
+      createdAt: now,
+      updatedAt: now
+    }).run();
+    if (projectScenarios.length) {
+      await tx.insert(scenarioTurbines).values(projectScenarios.map((scenario) => ({
+        scenarioId: scenario.id,
+        turbineId,
+        xM: validated.xM,
+        yM: validated.yM,
+        command: "operational" as const,
+        updatedAt: now
+      }))).run();
+    }
+    await tx.update(scenarios).set({ updatedAt: now }).where(eq(scenarios.projectId, projectId)).run();
+    await tx.update(projects).set({ updatedAt: now }).where(eq(projects.id, projectId)).run();
+  });
+  const nextProject = await getProject(db, projectId);
+  return { turbine: nextProject.turbines.find((turbine) => turbine.id === turbineId)!, project: nextProject };
+}
+
+async function updateTurbineImpl(db: WindScopeDatabase, projectId: string, turbineId: string, update: TurbineUpdateInput) {
+  const repository = farmRepository(db);
+  const [project, current] = await Promise.all([
+    repository.findProject(projectId),
+    repository.findProjectTurbine(projectId, turbineId)
+  ]);
+  if (!project) notFound("프로젝트를 찾을 수 없습니다.");
+  if (!current) notFound("수정할 터빈을 찾을 수 없습니다.");
+  if (update.name && update.name !== current.name) {
+    const all = await repository.listProjectTurbines(projectId);
+    if (all.some((turbine) => turbine.id !== turbineId && turbine.name === update.name)) conflict("같은 프로젝트에 동일한 터빈 이름을 사용할 수 없습니다.");
+  }
+  const merged = turbineInputSchema.parse({
+    id: current.id,
+    name: update.name ?? current.name,
+    xM: 0,
+    yM: 0,
+    command: "operational",
+    ratedPowerMW: update.ratedPowerMW ?? current.ratedPowerMW,
+    rotorDiameterM: update.rotorDiameterM ?? current.rotorDiameterM,
+    hubHeightM: update.hubHeightM ?? current.hubHeightM,
+    cutInMps: update.cutInMps ?? current.cutInMps,
+    ratedWindMps: update.ratedWindMps ?? current.ratedWindMps,
+    cutOutMps: update.cutOutMps ?? current.cutOutMps,
+    thrustCoefficient: update.thrustCoefficient ?? current.thrustCoefficient,
+    wakeExpansion: update.wakeExpansion ?? current.wakeExpansion,
+    powerCurve: update.powerCurve ?? parsePowerCurve(current.powerCurveJson)
+  });
+  const projectScenarios = await repository.listProjectScenarios(projectId);
+  for (const projectScenario of projectScenarios) {
+    const detail = await getScenarioImpl(db, projectScenario.id);
+    const nextTurbines = detail.turbines.map((turbine) => turbine.id === turbineId
+      ? { ...turbine, ...merged, xM: turbine.xM, yM: turbine.yM, command: turbine.command }
+      : turbine);
+    const issue = validateLayout(nextTurbines).find((item) => item.severity === "error");
+    if (issue) conflict(`${projectScenario.name}: ${issue.message}`);
+  }
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx.update(turbines).set({
+      name: merged.name,
+      ratedPowerMW: merged.ratedPowerMW,
+      rotorDiameterM: merged.rotorDiameterM,
+      hubHeightM: merged.hubHeightM,
+      cutInMps: merged.cutInMps,
+      ratedWindMps: merged.ratedWindMps,
+      cutOutMps: merged.cutOutMps,
+      thrustCoefficient: merged.thrustCoefficient,
+      wakeExpansion: merged.wakeExpansion,
+      powerCurveJson: JSON.stringify(merged.powerCurve),
+      displayOrder: update.displayOrder ?? current.displayOrder,
+      updatedAt: now
+    }).where(and(eq(turbines.projectId, projectId), eq(turbines.id, turbineId))).run();
+    await tx.update(scenarios).set({ updatedAt: now }).where(eq(scenarios.projectId, projectId)).run();
+    await tx.update(projects).set({ updatedAt: now }).where(eq(projects.id, projectId)).run();
+  });
+  const nextProject = await getProject(db, projectId);
+  return { turbine: nextProject.turbines.find((turbine) => turbine.id === turbineId)!, project: nextProject };
+}
+
+async function deleteTurbineImpl(db: WindScopeDatabase, projectId: string, turbineId: string) {
+  const repository = farmRepository(db);
+  const [project, turbine] = await Promise.all([
+    repository.findProject(projectId),
+    repository.findProjectTurbine(projectId, turbineId)
+  ]);
+  if (!project) notFound("프로젝트를 찾을 수 없습니다.");
+  if (!turbine) notFound("삭제할 터빈을 찾을 수 없습니다.");
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx.delete(turbines).where(and(eq(turbines.projectId, projectId), eq(turbines.id, turbineId))).run();
+    await tx.update(scenarios).set({ updatedAt: now }).where(eq(scenarios.projectId, projectId)).run();
+    await tx.update(projects).set({ updatedAt: now }).where(eq(projects.id, projectId)).run();
+  });
+  return {
+    deletedId: turbineId,
+    project: await getProject(db, projectId),
+    deletionPolicy: "모든 시나리오의 해당 터빈 배치와 터빈별 저장 결과를 함께 삭제합니다. 기존 Run은 입력 해시가 달라져 재계산됩니다."
+  };
+}
+
+async function promoteScenarioToBaselineImpl(db: WindScopeDatabase, scenarioId: string) {
+  const repository = farmRepository(db);
+  const experiment = await repository.findScenario(scenarioId);
+  if (!experiment) notFound("새 기준으로 지정할 시나리오를 찾을 수 없습니다.");
+  if (experiment.role !== "experiment") conflict("실험 시나리오만 새 기준으로 지정할 수 있습니다.");
+  const baseline = await repository.findBaseline(experiment.projectId);
+  if (!baseline) notFound("현재 기준 시나리오를 찾을 수 없습니다.");
+  const [baselinePlacements, experimentPlacements] = await Promise.all([
+    repository.listScenarioPlacements(baseline.id),
+    repository.listScenarioPlacements(experiment.id)
+  ]);
+  const archivedScenarioId = randomUUID();
+  const now = new Date().toISOString();
+  const archiveName = `이전 기준 · ${now.slice(0, 16).replace("T", " ")}`;
+  await db.transaction(async (tx) => {
+    await tx.insert(scenarios).values({
+      id: archivedScenarioId,
+      projectId: baseline.projectId,
+      name: archiveName,
+      role: "experiment",
+      windSpeedMps: baseline.windSpeedMps,
+      windDirectionDeg: baseline.windDirectionDeg,
+      airDensityKgM3: baseline.airDensityKgM3,
+      createdAt: now,
+      updatedAt: now
+    }).run();
+    if (baselinePlacements.length) {
+      await tx.insert(scenarioTurbines).values(baselinePlacements.map((placement) => ({
+        ...placement,
+        scenarioId: archivedScenarioId,
+        updatedAt: now
+      }))).run();
+    }
+    await tx.delete(scenarioTurbines).where(eq(scenarioTurbines.scenarioId, baseline.id)).run();
+    if (experimentPlacements.length) {
+      await tx.insert(scenarioTurbines).values(experimentPlacements.map((placement) => ({
+        ...placement,
+        scenarioId: baseline.id,
+        updatedAt: now
+      }))).run();
+    }
+    await tx.update(scenarios).set({
+      windSpeedMps: experiment.windSpeedMps,
+      windDirectionDeg: experiment.windDirectionDeg,
+      airDensityKgM3: experiment.airDensityKgM3,
+      updatedAt: now
+    }).where(eq(scenarios.id, baseline.id)).run();
+    await tx.update(projects).set({ updatedAt: now }).where(eq(projects.id, experiment.projectId)).run();
+  });
+  return {
+    baselineScenarioId: baseline.id,
+    experimentScenarioId: experiment.id,
+    archivedScenarioId,
+    baseline: await getScenario(db, baseline.id),
+    experiment: await getScenario(db, experiment.id),
+    archive: await getScenario(db, archivedScenarioId),
+    project: await getProject(db, experiment.projectId)
+  };
+}
+
 function toSimulationInput(scenario: Awaited<ReturnType<typeof getScenario>>): SimulationInput {
   const scenarioTurbinesInput: TurbineInput[] = scenario.turbines.map((turbine) => ({
     id: turbine.id,
@@ -361,10 +601,17 @@ function serialize<Args extends unknown[], Result>(operation: (db: WindScopeData
 
 export const listProjects = serialize(listProjectsImpl);
 export const createProject = serialize(createProjectImpl);
+export const updateProject = serialize(updateProjectImpl);
+export const deleteProject = serialize(deleteProjectImpl);
 export const getProject = serialize(getProjectImpl);
 export const listProjectTurbines = serialize(listProjectTurbinesImpl);
+export const createTurbine = serialize(createTurbineImpl);
+export const updateTurbine = serialize(updateTurbineImpl);
+export const deleteTurbine = serialize(deleteTurbineImpl);
 export const getScenario = serialize(getScenarioImpl);
 export const createExperimentScenario = serialize(createExperimentScenarioImpl);
+export const deleteScenario = serialize(deleteScenarioImpl);
+export const promoteScenarioToBaseline = serialize(promoteScenarioToBaselineImpl);
 export const renameScenario = serialize(renameScenarioImpl);
 export const updateScenarioSettings = serialize(updateScenarioSettingsImpl);
 export const updateTurbinePlacement = serialize(updateTurbinePlacementImpl);

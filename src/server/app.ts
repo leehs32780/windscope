@@ -7,19 +7,26 @@ import {
   compareScenarioToBaseline,
   createExperimentScenario,
   createProject,
+  createTurbine,
+  deleteProject,
+  deleteScenario,
+  deleteTurbine,
   getLatestSimulation,
   getProject,
   getScenario,
   listProjects,
   listProjectTurbines,
+  promoteScenarioToBaseline,
   renameScenario,
   resetScenarioLayout,
   runScenarioSimulation,
   updateScenarioSettings,
+  updateProject,
+  updateTurbine,
   updateTurbinePlacement
 } from "./farm-service";
 import { ApiError } from "./http-error";
-import { placementUpdateSchema, projectCreateSchema, scenarioCreateSchema, scenarioRenameSchema, scenarioSettingsSchema } from "../shared/validation";
+import { placementUpdateSchema, projectCreateSchema, projectUpdateSchema, scenarioCreateSchema, scenarioRenameSchema, scenarioSettingsSchema, turbineCreateSchema, turbineUpdateSchema } from "../shared/validation";
 
 function respond<T>(response: Response, data: T, status = 200): void {
   response.status(status).json({ data });
@@ -70,8 +77,26 @@ export function createApp(db: WindScopeDatabase, clientBuildDirectory?: string) 
     const input = projectCreateSchema.parse(request.body);
     respond(response, await createProject(db, input), 201);
   });
+  app.patch("/api/projects/:projectId", async (request, response) => {
+    const input = projectUpdateSchema.parse(request.body);
+    respond(response, await updateProject(db, request.params.projectId!, input));
+  });
+  app.delete("/api/projects/:projectId", async (request, response) => {
+    respond(response, await deleteProject(db, request.params.projectId!));
+  });
   app.get("/api/projects/:projectId", async (request, response) => respond(response, await getProject(db, request.params.projectId!)));
   app.get("/api/projects/:projectId/turbines", async (request, response) => respond(response, await listProjectTurbines(db, request.params.projectId!)));
+  app.post("/api/projects/:projectId/turbines", async (request, response) => {
+    const input = turbineCreateSchema.parse(request.body);
+    respond(response, await createTurbine(db, request.params.projectId!, input), 201);
+  });
+  app.patch("/api/projects/:projectId/turbines/:turbineId", async (request, response) => {
+    const input = turbineUpdateSchema.parse(request.body);
+    respond(response, await updateTurbine(db, request.params.projectId!, request.params.turbineId!, input));
+  });
+  app.delete("/api/projects/:projectId/turbines/:turbineId", async (request, response) => {
+    respond(response, await deleteTurbine(db, request.params.projectId!, request.params.turbineId!));
+  });
   app.post("/api/projects/:projectId/scenarios", async (request, response) => {
     const input = scenarioCreateSchema.parse(request.body);
     respond(response, await createExperimentScenario(db, request.params.projectId!, input.name, input.sourceScenarioId), 201);
@@ -80,6 +105,12 @@ export function createApp(db: WindScopeDatabase, clientBuildDirectory?: string) 
   app.patch("/api/scenarios/:scenarioId", async (request, response) => {
     const input = scenarioRenameSchema.parse(request.body);
     respond(response, await renameScenario(db, request.params.scenarioId!, input.name));
+  });
+  app.delete("/api/scenarios/:scenarioId", async (request, response) => {
+    respond(response, await deleteScenario(db, request.params.scenarioId!));
+  });
+  app.post("/api/scenarios/:scenarioId/promote-baseline", async (request, response) => {
+    respond(response, await promoteScenarioToBaseline(db, request.params.scenarioId!));
   });
   app.patch("/api/scenarios/:scenarioId/settings", async (request, response) => {
     const input = scenarioSettingsSchema.parse(request.body);

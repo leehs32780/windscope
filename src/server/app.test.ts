@@ -129,6 +129,92 @@ describe("WindScope API", () => {
     expect(response.body.data.scenarios).toHaveLength(2);
     expect(response.body.data.baselineScenarioId).toBeTruthy();
     expect(response.body.data.turbines).toHaveLength(0);
+    const updated = await request(app).patch(`/api/projects/${response.body.data.id}`)
+      .send({ name: "이름을 바꾼 단지", description: null }).expect(200);
+    expect(updated.body.data).toMatchObject({ name: "이름을 바꾼 단지", description: null });
+    await request(app).patch(`/api/projects/${response.body.data.id}`).send({}).expect(400);
+  });
+
+  it("creates, validates, updates and deletes turbine definitions across every scenario", async () => {
+    const project = (await request(app).post("/api/projects").send({ name: "CRUD 단지" }).expect(201)).body.data;
+    const payload = {
+      name: "터빈 A",
+      xM: 0,
+      yM: 0,
+      ratedPowerMW: 6,
+      rotorDiameterM: 150,
+      hubHeightM: 100,
+      cutInMps: 3,
+      ratedWindMps: 11,
+      cutOutMps: 25,
+      thrustCoefficient: 0.78,
+      wakeExpansion: 0.05,
+      powerCurve: [
+        { windSpeedMps: 0, powerMW: 0 },
+        { windSpeedMps: 3, powerMW: 0 },
+        { windSpeedMps: 6, powerMW: 1.2 },
+        { windSpeedMps: 9, powerMW: 4.2 },
+        { windSpeedMps: 11, powerMW: 6 },
+        { windSpeedMps: 24, powerMW: 6 },
+        { windSpeedMps: 25, powerMW: 0 }
+      ]
+    };
+    const created = (await request(app).post(`/api/projects/${project.id}/turbines`).send(payload).expect(201)).body.data;
+    const turbineId = created.turbine.id as string;
+    expect(created.project.turbines).toHaveLength(1);
+    for (const scenario of project.scenarios) {
+      const detail = (await request(app).get(`/api/scenarios/${scenario.id}`).expect(200)).body.data;
+      expect(detail.turbines[0]).toMatchObject({ id: turbineId, xM: 0, yM: 0, command: "operational" });
+    }
+    await request(app).post(`/api/projects/${project.id}/turbines`).send({ ...payload, name: "잘못된 곡선", ratedWindMps: 2 }).expect(400);
+    await request(app).post(`/api/projects/${project.id}/turbines`).send({ ...payload, name: "터빈 A", xM: 500 }).expect(409);
+    const neighbor = (await request(app).post(`/api/projects/${project.id}/turbines`)
+      .send({ ...payload, name: "터빈 B", xM: 200 }).expect(201)).body.data.turbine;
+    await request(app).patch(`/api/projects/${project.id}/turbines/${turbineId}`)
+      .send({ rotorDiameterM: 300, hubHeightM: 200 }).expect(409);
+    await request(app).delete(`/api/projects/${project.id}/turbines/${neighbor.id}`).expect(200);
+    const curve7 = payload.powerCurve.map((point) => ({ ...point, powerMW: point.powerMW === 6 ? 7 : point.powerMW }));
+    const updated = (await request(app).patch(`/api/projects/${project.id}/turbines/${turbineId}`)
+      .send({ name: "터빈 A-개정", ratedPowerMW: 7, powerCurve: curve7 }).expect(200)).body.data;
+    expect(updated.turbine).toMatchObject({ name: "터빈 A-개정", ratedPowerMW: 7 });
+    const experimentId = project.scenarios.find((scenario: { role: string }) => scenario.role === "experiment").id;
+    const simulated = (await request(app).post(`/api/scenarios/${experimentId}/simulate`).send({}).expect(200)).body.data;
+    expect(simulated.turbines).toHaveLength(1);
+    const deleted = (await request(app).delete(`/api/projects/${project.id}/turbines/${turbineId}`).expect(200)).body.data;
+    expect(deleted.project.turbines).toHaveLength(0);
+    expect(deleted.deletionPolicy).toContain("재계산");
+    expect((await request(app).get(`/api/scenarios/${experimentId}`).expect(200)).body.data.turbines).toHaveLength(0);
+    expect((await request(app).get(`/api/scenarios/${experimentId}/results/latest`).expect(200)).body.data.isStale).toBe(true);
+  });
+
+  it("archives the old baseline and promotes an experiment without locking the experiment", async () => {
+    await request(app).patch("/api/scenarios/north-sea-experiment/settings").send({ windSpeedMps: 12.4, windDirectionDeg: 90 }).expect(200);
+    await request(app).put("/api/scenarios/north-sea-experiment/turbines/north-sea-turbine-01")
+      .send({ xM: -900, command: "maintenance_stop" }).expect(200);
+    const promoted = (await request(app).post("/api/scenarios/north-sea-experiment/promote-baseline").send({}).expect(200)).body.data;
+    expect(promoted.baselineScenarioId).toBe("north-sea-baseline");
+    expect(promoted.experimentScenarioId).toBe("north-sea-experiment");
+    expect(promoted.baseline).toMatchObject({ role: "baseline", windSpeedMps: 12.4, windDirectionDeg: 90 });
+    expect(promoted.baseline.turbines[0]).toMatchObject({ xM: -900, command: "maintenance_stop" });
+    expect(promoted.archive).toMatchObject({ role: "experiment", windSpeedMps: 9.5, windDirectionDeg: 0 });
+    expect(promoted.archive.turbines[0]).toMatchObject({ xM: -700, command: "operational" });
+    expect(promoted.experiment).toMatchObject({ role: "experiment", windSpeedMps: 12.4 });
+    await request(app).patch("/api/scenarios/north-sea-experiment/settings").send({ windSpeedMps: 13 }).expect(200);
+    expect(client.prepare("SELECT COUNT(*) AS count FROM scenarios WHERE project_id = ? AND role = 'baseline'").get("north-sea-demo")?.count).toBe(1);
+    await request(app).post("/api/scenarios/north-sea-baseline/promote-baseline").send({}).expect(409);
+  });
+
+  it("deletes experiments and projects according to documented cascade policy", async () => {
+    await request(app).delete("/api/scenarios/north-sea-baseline").expect(409);
+    const duplicate = (await request(app).post("/api/scenarios/north-sea-experiment/duplicate").send({ name: "삭제 대상" }).expect(201)).body.data;
+    const deletedScenario = (await request(app).delete(`/api/scenarios/${duplicate.id}`).expect(200)).body.data;
+    expect(deletedScenario.deletionPolicy).toContain("시뮬레이션 결과");
+    await request(app).get(`/api/scenarios/${duplicate.id}`).expect(404);
+    const project = (await request(app).post("/api/projects").send({ name: "삭제할 단지" }).expect(201)).body.data;
+    const deletedProject = (await request(app).delete(`/api/projects/${project.id}`).expect(200)).body.data;
+    expect(deletedProject.deletionPolicy).toContain("함께 삭제");
+    await request(app).get(`/api/projects/${project.id}`).expect(404);
+    expect(client.prepare("SELECT COUNT(*) AS count FROM scenarios WHERE project_id = ?").get(project.id)?.count).toBe(0);
   });
 
   it("compares fresh scenarios before any saved run without overlapping SQLite transactions", async () => {
